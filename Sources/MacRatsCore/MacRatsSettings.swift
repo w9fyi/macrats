@@ -86,6 +86,43 @@ public struct MacRatsSettings: Codable, Equatable, Sendable {
     /// Empty string = use the default `<appsupport>/logs/`.
     public var chatLogSubdirectory: String = ""
 
+    // MARK: - Transport tuning (v1.0 — matches D-Rats transport.py defaults)
+
+    /// Number of `0x01` filler bytes prefixed to the first DDT2 frame
+    /// after a period of idle. Purpose: wake up the receiving radio's
+    /// DSP / power-save mode so the real frame's leading bytes aren't
+    /// missed.
+    ///
+    /// D-Rats's upstream default is `8`; its wiki recommends `16` for
+    /// RADIO connections and `0` (disabled) for NET / ratflector. We
+    /// default to `16` because MacRats v1.0's primary use case is
+    /// RADIO.
+    ///
+    /// Matches `d_rats/transport.py` `warmup_length` (default 8,
+    /// wiki recommends 16).
+    public var warmupLength: Int = 16
+
+    /// Number of seconds the transport must be idle before the next
+    /// outbound frame is preceded by a warmup frame. Set to `0` to
+    /// disable warmup frames entirely — appropriate for NET /
+    /// ratflector connections where the receiver isn't a radio.
+    ///
+    /// Matches `d_rats/transport.py` `warmup_timeout` (default 3).
+    public var warmupTimeoutSeconds: TimeInterval = 3.0
+
+    /// Optional fixed delay (in seconds) inserted between outbound
+    /// frame batches. A positive value is a deterministic sleep; a
+    /// negative value means "random delay between 0 and |value|
+    /// seconds". Default `0` = no delay.
+    ///
+    /// Matches `d_rats/transport.py` `force_delay`.
+    public var forceDelaySeconds: TimeInterval = 0
+
+    /// Enable the wire-level byte logger (`~/Downloads/MacRats/wire.log`).
+    /// Off by default — turned on by the user when they want to watch
+    /// the wire during a bench test. Tailable with `tail -f`.
+    public var wireLoggingEnabled: Bool = false
+
     // MARK: - Connection types
 
     public enum ConnectionKind: String, Codable, CaseIterable, Sendable {

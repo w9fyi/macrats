@@ -15,6 +15,11 @@ struct MacRatsSettingsTests {
         #expect(s.showStatusUpdatesInChat == true)
         #expect(s.fixedLatitude == nil)
         #expect(s.fixedLongitude == nil)
+        // Warmup + wire-logging defaults (match D-Rats upstream + MacRats)
+        #expect(s.warmupLength == 16)
+        #expect(s.warmupTimeoutSeconds == 3.0)
+        #expect(s.forceDelaySeconds == 0)
+        #expect(s.wireLoggingEnabled == false)
     }
 
     @Test("Round-trip encode/decode preserves every field")
@@ -37,6 +42,10 @@ struct MacRatsSettingsTests {
         original.ignoreRegex = "[QST]"
         original.showStatusUpdatesInChat = false
         original.chatLogSubdirectory = "my-logs"
+        original.warmupLength = 32
+        original.warmupTimeoutSeconds = 5
+        original.forceDelaySeconds = -2  // random 0..2s
+        original.wireLoggingEnabled = true
 
         let encoder = JSONEncoder()
         let data = try encoder.encode(original)

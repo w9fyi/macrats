@@ -144,6 +144,51 @@ struct ConfigSheet: View {
             Text("115200").tag(Int32(115200))
         }
         .onChange(of: working.serialBaudRate) { _, _ in commit() }
+
+        // MARK: - Warmup frame tuning (radio-specific)
+        Section {
+            Stepper("Warmup length: \(working.warmupLength) bytes",
+                    value: $working.warmupLength,
+                    in: 0...64)
+                .onChange(of: working.warmupLength) { _, _ in commit() }
+                .accessibilityHint("Number of filler bytes prefixed to the first frame after an idle period, to wake up the receiving radio. D-Rats recommends 16 for radio. Set to 0 to disable warmup entirely.")
+
+            Stepper("Warmup idle timeout: \(Self.formatSeconds(working.warmupTimeoutSeconds))",
+                    value: $working.warmupTimeoutSeconds,
+                    in: 0...30,
+                    step: 1)
+                .onChange(of: working.warmupTimeoutSeconds) { _, _ in commit() }
+                .accessibilityHint("Seconds of idle before the next transmission gets a warmup prefix. 3 seconds is the D-Rats default. 0 disables warmup.")
+
+            Stepper("Force TX delay: \(Self.formatSeconds(working.forceDelaySeconds))",
+                    value: $working.forceDelaySeconds,
+                    in: 0...10,
+                    step: 0.5)
+                .onChange(of: working.forceDelaySeconds) { _, _ in commit() }
+                .accessibilityHint("Fixed delay inserted before each transmission batch. 0 disables.")
+
+            Toggle("Log wire traffic to ~/Downloads/MacRats/wire.log",
+                   isOn: $working.wireLoggingEnabled)
+                .onChange(of: working.wireLoggingEnabled) { _, _ in commit() }
+                .accessibilityHint("When enabled, every byte sent to and received from the radio is written to a log file you can tail in Terminal. Useful for bench testing. Off by default.")
+        } header: {
+            Text("Transport tuning")
+        } footer: {
+            Text("These settings control the low-level wire behavior toward the radio. Defaults match D-Rats's recommended values for radio connections. TCP loopback connections ignore these settings and disable warmup automatically.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    /// Format a TimeInterval as a short human-readable string for a
+    /// Stepper label.
+    private static func formatSeconds(_ value: TimeInterval) -> String {
+        if value == 0 { return "disabled" }
+        // Round to one decimal if fractional, else integer.
+        if value == floor(value) {
+            return "\(Int(value)) s"
+        }
+        return String(format: "%.1f s", value)
     }
 
     @ViewBuilder

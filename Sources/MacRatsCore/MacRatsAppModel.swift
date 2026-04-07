@@ -64,6 +64,11 @@ public final class MacRatsAppModel: @unchecked Sendable {
     /// in-memory log from disk on startup.
     private let chatLogStore: ChatLogStore?
 
+    /// Optional wire-level byte logger. Created lazily the first
+    /// time wire logging is enabled, so users who never turn it on
+    /// never get an empty log file sitting in ~/Downloads/MacRats/.
+    private var wireLogger: WireLogger?
+
     public init(settings: MacRatsSettings = MacRatsSettings(),
                 settingsURL: URL? = nil,
                 chatLogStore: ChatLogStore? = nil,
@@ -174,6 +179,17 @@ public final class MacRatsAppModel: @unchecked Sendable {
             chatSession.pingReplyText = newSettings.pingReplyText
         }
 
+        // Update the session manager's wire tuning live so warmup
+        // changes take effect on the next outbound frame. Only applies
+        // to serial connections — TCP always uses the NET profile.
+        if let manager, newSettings.connectionKind == .serial {
+            manager.wireTuning = SessionManager.WireTuning(
+                warmupLength: newSettings.warmupLength,
+                warmupTimeoutSeconds: newSettings.warmupTimeoutSeconds,
+                forceDelaySeconds: newSettings.forceDelaySeconds
+            )
+        }
+
         // Persist.
         do {
             try newSettings.save(to: settingsURL)
@@ -222,11 +238,46 @@ public final class MacRatsAppModel: @unchecked Sendable {
                                                            port: settings.tcpPort))
         }
 
-        let manager = SessionManager(callsign: settings.callsign, transport: transport)
+        // Translate settings into the SessionManager's wire-tuning
+        // profile. For .tcpLoopback and .tcpRatflector we force-disable
+        // the warmup frame (there's no radio on the other end that
+        // benefits from it), regardless of what the user set — it's
+        // just wasted bytes on the wire.
+        let wireTuning: SessionManager.WireTuning
+        switch settings.connectionKind {
+        case .serial:
+            wireTuning = SessionManager.WireTuning(
+                warmupLength: settings.warmupLength,
+                warmupTimeoutSeconds: settings.warmupTimeoutSeconds,
+                forceDelaySeconds: settings.forceDelaySeconds
+            )
+        case .tcpLoopback, .tcpRatflector, .disconnected:
+            wireTuning = .net
+        }
+
+        let manager = SessionManager(callsign: settings.callsign,
+                                     transport: transport,
+                                     wireTuning: wireTuning)
         let chat = ChatSession(pingReplyText: settings.pingReplyText)
         let shim = ChatDelegateShim(owner: self)
         chat.delegate = shim
         manager.add(chat, id: 1)
+
+        // Wire logging: if enabled in settings, attach a WireLogger
+        // that writes to ~/Downloads/MacRats/wire.log. The user can
+        // then `tail -f` that file in Terminal while running a bench
+        // test. Off by default.
+        if settings.wireLoggingEnabled {
+            if wireLogger == nil {
+                wireLogger = try? WireLogger.defaultLogger()
+            }
+            if let wireLogger {
+                manager.wireLogHandler = { [weak wireLogger] direction, data in
+                    wireLogger?.log(direction, data)
+                }
+                log("wire logging enabled — tailing ~/Downloads/MacRats/wire.log")
+            }
+        }
 
         manager.logHandler = { [weak self] msg in
             self?.log(msg)
@@ -308,11 +359,17 @@ public final class MacRatsAppModel: @unchecked Sendable {
                                dStation: "CQCQCQ",
                                text: text,
                                outgoing: true))
-            // Small delay so the bytes actually reach the transport
-            // layer before we cancel the underlying socket. For TCP
-            // this matters because cancel() short-circuits any queued
-            // outbound data in the NWConnection.
-            Thread.sleep(forTimeInterval: 0.15)
+            // Delay so the bytes actually reach the transport layer
+            // before we cancel it. TCP's NWConnection.cancel() will
+            // short-circuit any queued outbound data, so we need a
+            // flush window. Serial radios additionally need tail-out
+            // time for the TX chain: the D-Rats docs and TH-D75
+            // manual both describe tens-to-hundreds of milliseconds
+            // of TX delay. 500ms is a conservative value that works
+            // for both transport types.
+            let postSignoffDelay: TimeInterval =
+                (manager?.transport is USBSerialTransport) ? 0.5 : 0.15
+            Thread.sleep(forTimeInterval: postSignoffDelay)
         } catch {
             log("sign-off send failed: \(error.localizedDescription)")
         }

@@ -31,6 +31,50 @@ import Foundation
 /// hop-and-wait every time a session wants to write.
 public final class SessionManager: @unchecked Sendable {
 
+    // MARK: - Wire-protocol tuning
+
+    /// Per-transport wire-protocol tuning. Mirrors the `warmup_length`,
+    /// `warmup_timeout`, and `force_delay` knobs in upstream D-Rats's
+    /// `d_rats/transport.py`. Defaults match D-Rats's recommended
+    /// RADIO values.
+    public struct WireTuning: Sendable, Equatable {
+        /// Number of `0x01` filler bytes prefixed to the first DDT2
+        /// frame after a period of idle. 16 is the wiki-recommended
+        /// default for RADIO connections.
+        public var warmupLength: Int = 16
+
+        /// Number of seconds the transport must be idle before the
+        /// next outbound frame is preceded by a warmup frame. Set to
+        /// 0 to disable warmup frames entirely.
+        public var warmupTimeoutSeconds: TimeInterval = 3.0
+
+        /// Optional fixed delay inserted before each outbound frame
+        /// batch. Positive = deterministic sleep; negative = random
+        /// delay between 0 and `|value|` seconds; 0 = no delay.
+        public var forceDelaySeconds: TimeInterval = 0
+
+        public init(warmupLength: Int = 16,
+                    warmupTimeoutSeconds: TimeInterval = 3.0,
+                    forceDelaySeconds: TimeInterval = 0) {
+            self.warmupLength = warmupLength
+            self.warmupTimeoutSeconds = warmupTimeoutSeconds
+            self.forceDelaySeconds = forceDelaySeconds
+        }
+
+        /// The "NET / ratflector" profile — warmup disabled, no
+        /// force delay. Used when talking to non-radio peers.
+        public static var net: WireTuning {
+            WireTuning(warmupLength: 0, warmupTimeoutSeconds: 0, forceDelaySeconds: 0)
+        }
+
+        /// The "RADIO" profile — 16-byte warmup, 3-second idle
+        /// threshold. Matches D-Rats's wiki recommendation for
+        /// connections to an actual HT.
+        public static var radio: WireTuning {
+            WireTuning(warmupLength: 16, warmupTimeoutSeconds: 3, forceDelaySeconds: 0)
+        }
+    }
+
     // MARK: - Configuration
 
     /// This station's callsign. Stamped into every outbound frame as the
@@ -41,12 +85,31 @@ public final class SessionManager: @unchecked Sendable {
     /// The byte-pipe transport this manager owns.
     public let transport: RadioTransport
 
+    /// Wire-protocol tuning — warmup length/timeout, force delay.
+    /// Mutable at runtime so the Radio preferences tab can change it
+    /// without requiring a disconnect/reconnect.
+    public var wireTuning: WireTuning
+
     // MARK: - Internal state
 
     private let lock = NSLock()
     private var sessionsById: [UInt8: Session] = [:]
     private let splitter = DDT2FrameSplitter()
     private let scheduleQueue = DispatchQueue(label: "MacRatsCore.SessionManager.schedule")
+
+    /// Timestamp of the most recent outbound frame (real or warmup).
+    /// `nil` before the first send, which forces a warmup on the
+    /// first transmission. Protected by `lock`.
+    private var _lastTransmitTime: Date?
+
+    /// Reserved frame type used by D-Rats to signal "this is a
+    /// warmup frame, ignore its payload." Matches upstream
+    /// `d_rats/transport.py` exactly.
+    public static let warmupFrameType: UInt8 = 254
+
+    /// Reserved callsign used as source/destination in warmup frames.
+    /// Matches upstream `d_rats/transport.py` exactly.
+    public static let warmupStation: String = "!"
 
     /// Optional callback the transport delegate hops through.
     private var transportDelegateShim: ManagerTransportShim?
@@ -72,13 +135,24 @@ public final class SessionManager: @unchecked Sendable {
 
     // MARK: - Init
 
-    public init(callsign: String, transport: RadioTransport) {
+    public init(callsign: String,
+                transport: RadioTransport,
+                wireTuning: WireTuning = .radio) {
         self.callsign = callsign
         self.transport = transport
+        self.wireTuning = wireTuning
         let shim = ManagerTransportShim(owner: self)
         self.transportDelegateShim = shim
         transport.setDelegate(shim)
     }
+
+    /// Optional wire-log hook. Called once for each raw byte chunk
+    /// written to the transport (with direction `"TX"`) and once for
+    /// each raw byte chunk received from the transport (with direction
+    /// `"RX"`). The MacRats app wires this to an append-only file at
+    /// `~/Downloads/MacRats/wire.log` that can be tailed with
+    /// `tail -f` during bench tests.
+    public var wireLogHandler: (@Sendable (_ direction: String, _ data: Data) -> Void)?
 
     // MARK: - Session registry
 
@@ -128,7 +202,31 @@ public final class SessionManager: @unchecked Sendable {
     /// Called by a `Session` when it has a frame ready to send. The
     /// manager encodes the frame through `DDT2EncodedFrame.pack()` and
     /// writes the result to the transport.
+    ///
+    /// If the transport has been idle longer than
+    /// `wireTuning.warmupTimeoutSeconds`, a warmup frame (type 254,
+    /// source and destination both `"!"`, payload `[0x01]*warmupLength`)
+    /// is sent FIRST to wake up the receiving radio's DSP / power-save
+    /// mode. This matches upstream D-Rats's behavior in
+    /// `d_rats/transport.py` `send_frames()`.
+    ///
+    /// Warmup is silently skipped when:
+    /// - `warmupTimeoutSeconds <= 0` (disabled entirely, NET profile)
+    /// - `warmupLength <= 0` (defensive, shouldn't happen in normal
+    ///   settings but prevents a zero-byte warmup frame)
+    /// - The transport transmitted within the timeout window (real
+    ///   conversation in progress)
     public func outgoing(_ session: Session, frame: DDT2Frame) throws {
+        // Apply force delay BEFORE anything touches the wire. Matches
+        // upstream's `send_frames()`: delay once per call. Positive =
+        // deterministic sleep; negative = random 0..|value| seconds.
+        applyForceDelayIfNeeded()
+
+        // Decide whether to emit a warmup frame first.
+        if shouldSendWarmup() {
+            try sendWarmupFrame()
+        }
+
         var finalFrame = frame
         finalFrame.session = session.id  // force the session id onto every frame
 
@@ -138,9 +236,62 @@ public final class SessionManager: @unchecked Sendable {
         lock.lock()
         session.stats.sentBytes += finalFrame.data.count
         session.stats.sentWireBytes += encoded.count
+        _lastTransmitTime = Date()
         lock.unlock()
 
+        wireLogHandler?("TX", encoded)
         try transport.send(encoded)
+    }
+
+    /// True if a warmup frame should be sent before the next real
+    /// outbound frame. Extracted for unit-testability.
+    internal func shouldSendWarmup(now: Date = Date()) -> Bool {
+        let tuning = wireTuning
+        guard tuning.warmupTimeoutSeconds > 0, tuning.warmupLength > 0 else {
+            return false
+        }
+        lock.lock()
+        let last = _lastTransmitTime
+        lock.unlock()
+        guard let last else {
+            // Never transmitted — always warm up on the very first frame.
+            return true
+        }
+        return now.timeIntervalSince(last) > tuning.warmupTimeoutSeconds
+    }
+
+    /// Build, encode, and send the warmup frame. Also updates
+    /// `_lastTransmitTime` so the check in `shouldSendWarmup()` works
+    /// for the real frame that follows immediately after.
+    private func sendWarmupFrame() throws {
+        let length = wireTuning.warmupLength
+        var frame = DDT2Frame()
+        frame.seq = 0
+        frame.session = 0
+        frame.type = Self.warmupFrameType
+        frame.sStation = Self.warmupStation
+        frame.dStation = Self.warmupStation
+        frame.data = Data(repeating: 0x01, count: length)
+        frame.compress = false
+        let encoded = DDT2EncodedFrame.pack(frame)
+
+        lock.lock()
+        _lastTransmitTime = Date()
+        lock.unlock()
+
+        wireLogHandler?("TX", encoded)
+        try transport.send(encoded)
+    }
+
+    private func applyForceDelayIfNeeded() {
+        let delay = wireTuning.forceDelaySeconds
+        if delay > 0 {
+            Thread.sleep(forTimeInterval: delay)
+        } else if delay < 0 {
+            let magnitude = -delay
+            let randomDelay = Double.random(in: 0...magnitude)
+            Thread.sleep(forTimeInterval: randomDelay)
+        }
     }
 
     // MARK: - Incoming path (transport → sessions)
@@ -149,6 +300,7 @@ public final class SessionManager: @unchecked Sendable {
     /// automatically via the shim. Exposed publicly for tests that want
     /// to inject frames without wiring up a full transport.
     public func ingestBytes(_ data: Data) {
+        wireLogHandler?("RX", data)
         let frames = splitter.feed(data)
         for wireFrame in frames {
             do {
@@ -161,6 +313,20 @@ public final class SessionManager: @unchecked Sendable {
     }
 
     private func routeIncoming(_ frame: DDT2Frame, wireSize: Int) {
+        // Filter out warmup frames (type 254, sStation/dStation "!")
+        // before any observers see them. These are purely a wake-up
+        // signal for the receiving radio's DSP and carry no
+        // application payload. Without this filter they'd pollute the
+        // heard-stations list with a fake "!" callsign and the chat
+        // log with a meaningless frame.
+        if frame.type == Self.warmupFrameType
+            && frame.sStation == Self.warmupStation
+            && frame.dStation == Self.warmupStation {
+            // Log at debug level but don't fire any callbacks.
+            log("ignoring inbound warmup frame (\(frame.data.count) bytes)")
+            return
+        }
+
         // Hook for the app layer — heard-stations list, traffic monitor,
         // etc. Runs before the per-session dispatch so the app sees
         // everything, even frames that don't route to a registered
