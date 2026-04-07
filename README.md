@@ -74,7 +74,51 @@ Primary test radio: **Kenwood TH-D75** (built-in TNC, USB-C serial, D-STAR DV sl
 
 **v1.0 transport: USB only.** Bluetooth SPP is planned for v1.1 but is **not** a free addition — although macOS exposes paired Bluetooth SPP devices as `/dev/cu.*` device files, the device file is a stale shim until an `IOBluetooth` ACL connection is open AND an `IOBluetoothRFCOMMChannel` reference is held alive in memory. Specifically for the TH-D75, the data channel is **RFCOMM channel 2** (not the SDP-advertised SPP channel — this is hard-won knowledge from the sibling `th-programmer` project's `BluetoothManager.swift`). v1.1 will add a thin `BluetoothCoordinator` modeled on that proven pattern, then hand the resulting cu.* path to the existing `USBSerialTransport`.
 
-Future support beyond TH-D75: any radio that can carry D-STAR DV slow-data and exposes a serial / Bluetooth SPP / KISS TNC interface.
+## Radio compatibility
+
+**Short version: MacRats v0.1.0 works with the Kenwood TH-D75. That's the entire supported list.** It does *not* work with Icom radios, Yaesu radios, generic D-STAR radios, generic "MMDVM-compliant" hardware, or radios driven by an external soundcard TNC. The longer story is below — it matters because "supports D-STAR" and "speaks the protocol MacRats needs" are not the same set.
+
+### What MacRats actually speaks over the wire
+
+MacRats's USB serial transport speaks the [G4KLX MMDVMHost](https://github.com/g4klx/MMDVMHost) host↔modem protocol — the same one used by hotspot boards (ZUMspot, openSPOT, DVMega, MMDVM_HS_Hat). The TH-D75 is unusual because Kenwood put a real MMDVM-compliant modem inside the radio and exposes it over USB at 38400 baud whenever the radio is switched into Terminal Mode (Menu 650). MacRats then stuffs DDT2 bytes into the 3-byte slow-data slots inside each MMDVM voice frame, the radio packs them into D-STAR DV frames, and they go out on the air.
+
+So **"MMDVM-compliant"** in MacRats's vocabulary specifically means *"speaks the G4KLX host↔modem serial protocol over a serial port and is wired to a transmitter that puts D-STAR slow data on the air"*. That's a much narrower definition than "supports D-STAR" or "supports digital voice modes".
+
+### Supported today
+
+| Hardware | Status | Notes |
+|---|---|---|
+| **Kenwood TH-D75** | ✅ Tested, working | The reference radio. Phase 1 over-the-air pass on 2026-04-07. Requires the [Menu 614 fix](#configuring-the-th-d75-for-macrats). |
+
+### Should work in theory but untested
+
+| Hardware | Status | Notes |
+|---|---|---|
+| **MMDVM hotspot boards** (ZUMspot, openSPOT, DVMega, MMDVM_HS_Hat) plugged directly into the Mac via USB | 🟡 Untested | They speak the right protocol natively. You'd be transmitting at hotspot power levels (10–20 mW) into your local D-STAR reflector world, not over a real radio link, but the bytes should flow. Init sequence and RF config quirks may differ from the TH-D75 path. |
+| **A custom MMDVM modem board** wired to any D-STAR-capable transmitter | 🟡 Untested | Same caveat — protocol is right, mechanical and init details may differ. |
+
+If anyone has one of these boards and wants to try it, please file an issue with what you saw. Adding init quirks is much easier than the work it took to get the first radio working.
+
+### Won't work without new code
+
+| Hardware | Why | What it would take |
+|---|---|---|
+| **Icom IC-705 / ID-52 / ID-51 PLUS2 / IC-9700 / ID-5100** | Icom's "Internet Gateway" Terminal Mode is an Icom-proprietary protocol, not G4KLX MMDVM. Same air mode (D-STAR), completely different USB framing and command set. | A new `IcomTerminalTransport` parallel to the existing MMDVM path. On the v1.1/v1.2 roadmap. |
+| **Yaesu C4FM / Fusion radios** | Different mode (C4FM, not D-STAR) and a different slow-data layer. | A separate transport plus a separate session layer — large effort, lower priority. |
+| **Any analog FM radio + soundcard TNC** (Mobilinkd, PicoAPRS, Direwolf, etc.) | These speak AFSK over a soundcard interface, not a USB serial modem protocol. | A KISS TNC transport plus the existing audio TNC stack (Direwolf integration). v1.2+ roadmap. |
+| **Any radio + KISS-mode TNC** | MacRats has no KISS framing layer yet. | A `KISSTransport` layer between `RadioTransport` and the session layer. Modest effort once specified. |
+| **Older Kenwood TH-D74 / TM-D710 / TS-2000** | These have built-in TNCs but NOT in MMDVM terminal mode — they expose the TNC as a KISS-style packet interface (TH-D74) or AX.25 (others). | The KISS transport above. |
+
+### Roadmap
+
+In rough priority order (subject to change based on what hardware shows up):
+
+1. **Bluetooth SPP for the TH-D75** (v1.1) — same radio, no cable
+2. **Icom IC-705 / ID-52 transport** (v1.1 or v1.2) — second radio family, biggest user-facing impact
+3. **KISS TNC transport** (v1.2) — opens the door to packet radios in general, including the TH-D74
+4. **Hotspot board verification** (low effort, will be done as a side effect of helping anyone who tries)
+
+If you want to help move any of these forward — especially the Icom transport, since it requires actual hardware to test — please open an issue and say so.
 
 ## Configuring the TH-D75 for MacRats
 

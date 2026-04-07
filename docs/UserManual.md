@@ -186,10 +186,67 @@ Treat it like a public ham radio channel, because functionally it is one.
 
 ---
 
-## Connecting to a Kenwood TH-D75 over USB
+## Radio compatibility
 
-MacRats 0.1.0 supports the Kenwood TH-D75 D-STAR handheld over USB. Other
-radios are not yet supported.
+**MacRats 0.1.0 supports exactly one radio: the Kenwood TH-D75.** Before you
+go shopping for a different radio expecting it to work, please read this
+section — "supports D-STAR" and "works with MacRats" are not the same thing.
+
+### Why the TH-D75 specifically
+
+MacRats's USB transport speaks the [G4KLX MMDVMHost](https://github.com/g4klx/MMDVMHost)
+host↔modem protocol — the same protocol used by D-STAR hotspot boards like
+the ZUMspot, openSPOT, and DVMega. The TH-D75 is unusual because Kenwood
+put a real MMDVM-compliant modem inside the radio and exposes it over the
+USB-C port whenever you switch the radio into Terminal Mode (Menu 650).
+That makes the TH-D75 effectively a hotspot board with a built-in 5-watt
+transmitter and a 50-ohm antenna jack — exactly what MacRats needs.
+
+### What does NOT work with MacRats today
+
+- **Icom radios** — IC-705, ID-52, ID-51, ID-5100, IC-9700. These all
+  support D-STAR and several support an "Internet Gateway Terminal Mode",
+  but Icom's terminal mode is an Icom-proprietary protocol, **not** the
+  G4KLX MMDVM protocol MacRats speaks. Same air mode, completely different
+  USB framing. Icom transport is on the v1.1 / v1.2 roadmap but is not
+  available yet.
+- **Yaesu C4FM / Fusion radios** — these use a different digital voice
+  mode (C4FM) and a different slow-data layer. Out of scope for v1.x.
+- **Older Kenwood radios with built-in TNCs** — TH-D74, TM-D710G, TS-2000.
+  These have packet TNCs in KISS or AX.25 mode, not MMDVM terminal mode.
+  A KISS transport is on the roadmap.
+- **Any analog FM radio with an external soundcard TNC** (Mobilinkd,
+  PicoAPRS, Direwolf, etc.). These use AFSK over a sound card, not a
+  USB serial modem protocol. Out of scope for v1.0; soundcard TNC support
+  is being considered for v1.2+.
+- **Generic "MMDVM-compatible" hotspots used as hotspots** — i.e. running
+  Pi-Star or WPSD on a Pi connected to your network. MacRats talks
+  directly to a serial-attached modem; it does not connect to a Pi-Star
+  hotspot the way a third-party D-STAR client does.
+
+### What MIGHT work but has not been tested
+
+- **MMDVM hotspot boards plugged directly into the Mac via USB** —
+  ZUMspot, openSPOT, DVMega, MMDVM_HS_Hat. These speak the right protocol
+  natively, so the bytes should flow. You'd be transmitting at hotspot
+  power levels (10–20 mW) into your local D-STAR reflector world rather
+  than over a real radio link, and there may be init-sequence quirks the
+  TH-D75 path skips. **If you try this and it works (or doesn't), please
+  file an issue at <https://github.com/w9fyi/macrats/issues> and let us
+  know.**
+- **Other Kenwood handhelds with MMDVM terminal mode** — to our knowledge
+  the TH-D75 is currently the only Kenwood radio that ships with MMDVM
+  terminal mode. The TH-D74 does not have it.
+
+### The honest summary
+
+If you have a TH-D75, MacRats will work with it. If you have anything
+else, MacRats v0.1.0 will not transmit on the air today. The ratflector
+(Internet) connection mode works for everyone regardless of what radio
+they own, and is the recommended way to try MacRats while you wait for
+your radio family to be supported.
+
+## Connecting to a Kenwood TH-D75 over USB
 
 ### One-time radio setup
 
