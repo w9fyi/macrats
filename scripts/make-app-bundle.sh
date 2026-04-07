@@ -14,9 +14,10 @@
 # next to it.
 #
 # Usage:
-#     scripts/make-app-bundle.sh              # debug build, ad-hoc signed
-#     scripts/make-app-bundle.sh release      # release build, ad-hoc signed
-#     scripts/make-app-bundle.sh release open # release + open on completion
+#     scripts/make-app-bundle.sh                       # debug build, ad-hoc signed
+#     scripts/make-app-bundle.sh release               # release build, ad-hoc signed
+#     scripts/make-app-bundle.sh release universal    # release universal (arm64 + x86_64)
+#     scripts/make-app-bundle.sh release open          # release + open on completion
 #
 # Output:
 #     build/MacRats.app (a real macOS bundle you can drag to /Applications)
@@ -32,13 +33,15 @@ cd "$ROOT_DIR"
 
 CONFIGURATION="debug"
 DO_OPEN="no"
+UNIVERSAL="no"
 for arg in "$@"; do
     case "$arg" in
-        debug)   CONFIGURATION="debug" ;;
-        release) CONFIGURATION="release" ;;
-        open)    DO_OPEN="yes" ;;
+        debug)     CONFIGURATION="debug" ;;
+        release)   CONFIGURATION="release" ;;
+        open)      DO_OPEN="yes" ;;
+        universal) UNIVERSAL="yes" ;;
         -h|--help)
-            echo "Usage: $0 [debug|release] [open]"
+            echo "Usage: $0 [debug|release] [universal] [open]"
             exit 0
             ;;
         *)
@@ -66,8 +69,18 @@ echo ""
 
 # ---- Build the SwiftPM executable --------------------------------------
 
-echo "==> Building SwiftPM target 'macrats' ($CONFIGURATION)..."
-if [ "$CONFIGURATION" = "release" ]; then
+echo "==> Building SwiftPM target 'macrats' ($CONFIGURATION, universal=$UNIVERSAL)..."
+if [ "$UNIVERSAL" = "yes" ]; then
+    if [ "$CONFIGURATION" != "release" ]; then
+        echo "ERROR: universal builds require release configuration" >&2
+        exit 1
+    fi
+    # SwiftPM 6.x supports passing --arch twice to produce a fat binary
+    # under .build/apple/Products/Release/.
+    swift build --configuration release --product macrats \
+        --arch arm64 --arch x86_64
+    BIN_PATH=".build/apple/Products/Release/macrats"
+elif [ "$CONFIGURATION" = "release" ]; then
     swift build --configuration release --product macrats
     BIN_PATH=".build/release/macrats"
 else
