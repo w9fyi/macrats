@@ -34,6 +34,11 @@ struct MacRatsAppModelTests {
 
     /// Build a (server, client) pair of MacRatsAppModel instances both
     /// connected over TCP loopback. Settings are wired up for each side.
+    ///
+    /// Sign-on and sign-off messages are cleared by default so tests
+    /// that assert "no messages until I send one" aren't polluted by
+    /// the auto-broadcast. Use `makePairWithClientSignMessages` when a
+    /// test specifically exercises the sign-on/off behavior.
     private static func makePair(port: UInt16? = nil) async throws -> (server: MacRatsAppModel,
                                                                        client: MacRatsAppModel,
                                                                        port: UInt16) {
@@ -46,6 +51,8 @@ struct MacRatsAppModelTests {
         serverSettings.tcpHost = ""
         serverSettings.tcpPort = actualPort
         serverSettings.pingReplyText = "Server here — AI5OS"
+        serverSettings.signOnMessage = ""
+        serverSettings.signOffMessage = ""
         let serverModel = MacRatsAppModel(settings: serverSettings)
         try serverModel.connect()
 
@@ -59,6 +66,8 @@ struct MacRatsAppModelTests {
         clientSettings.tcpHost = "127.0.0.1"
         clientSettings.tcpPort = actualPort
         clientSettings.pingReplyText = "Client here — W9FYI"
+        clientSettings.signOnMessage = ""
+        clientSettings.signOffMessage = ""
         let clientModel = MacRatsAppModel(settings: clientSettings)
         try clientModel.connect()
 
@@ -277,5 +286,155 @@ struct MacRatsAppModelTests {
         // All 5 messages present.
         let received = pair.server.chatMessages.filter { $0.kind == .message && !$0.outgoing }
         #expect(received.count == 5)
+    }
+
+    // MARK: - Sign-on / sign-off auto-messages
+
+    /// Build a pair where the CLIENT side has a customized sign-on /
+    /// sign-off. The server is a plain listener that records whatever
+    /// chat messages arrive.
+    private static func makePairWithClientSignMessages(
+        signOn: String,
+        signOff: String
+    ) async throws -> (server: MacRatsAppModel,
+                       client: MacRatsAppModel,
+                       port: UInt16) {
+        let actualPort = UInt16.random(in: 49152...65535)
+
+        var serverSettings = MacRatsSettings()
+        serverSettings.callsign = "AI5OS"
+        serverSettings.connectionKind = .tcpLoopback
+        serverSettings.tcpHost = ""
+        serverSettings.tcpPort = actualPort
+        // Server explicitly empty sign-on/off so we're not fighting
+        // noise from the other side.
+        serverSettings.signOnMessage = ""
+        serverSettings.signOffMessage = ""
+        let serverModel = MacRatsAppModel(settings: serverSettings)
+        try serverModel.connect()
+
+        try await Task.sleep(nanoseconds: 60_000_000)
+
+        var clientSettings = MacRatsSettings()
+        clientSettings.callsign = "W9FYI"
+        clientSettings.connectionKind = .tcpLoopback
+        clientSettings.tcpHost = "127.0.0.1"
+        clientSettings.tcpPort = actualPort
+        clientSettings.signOnMessage = signOn
+        clientSettings.signOffMessage = signOff
+        let clientModel = MacRatsAppModel(settings: clientSettings)
+        try clientModel.connect()
+
+        try await waitUntil(timeout: 3.0) {
+            serverModel.connectionStatus == .connected
+                && clientModel.connectionStatus == .connected
+        }
+
+        return (serverModel, clientModel, actualPort)
+    }
+
+    @Test("Sign-on message is auto-broadcast on connect")
+    func signOnAutoBroadcast() async throws {
+        let pair = try await Self.makePairWithClientSignMessages(
+            signOn: "W9FYI online for testing",
+            signOff: ""
+        )
+        defer {
+            pair.client.disconnect()
+            pair.server.disconnect()
+        }
+
+        // Server should eventually see the client's sign-on message.
+        try await Self.waitUntil(timeout: 3.0) {
+            pair.server.chatMessages.contains { msg in
+                msg.kind == .message
+                    && !msg.outgoing
+                    && msg.sStation == "W9FYI"
+                    && msg.text == "W9FYI online for testing"
+            }
+        }
+
+        // AND the client's own log should contain the outgoing sign-on.
+        let clientLog = pair.client.chatMessages
+        #expect(clientLog.contains { msg in
+            msg.kind == .message
+                && msg.outgoing
+                && msg.text == "W9FYI online for testing"
+        })
+    }
+
+    @Test("Sign-on is NOT sent when the sign-on message is empty")
+    func signOnSkippedWhenEmpty() async throws {
+        let pair = try await Self.makePairWithClientSignMessages(
+            signOn: "",
+            signOff: ""
+        )
+        defer {
+            pair.client.disconnect()
+            pair.server.disconnect()
+        }
+
+        // Give the system a moment — then verify the server never
+        // received any chat message from the client.
+        try await Task.sleep(nanoseconds: 300_000_000)
+        let serverReceivedMessages = pair.server.chatMessages.filter {
+            $0.kind == .message && !$0.outgoing && $0.sStation == "W9FYI"
+        }
+        #expect(serverReceivedMessages.isEmpty)
+    }
+
+    @Test("Sign-off message is auto-broadcast before disconnect")
+    func signOffAutoBroadcast() async throws {
+        let pair = try await Self.makePairWithClientSignMessages(
+            signOn: "",
+            signOff: "W9FYI signing off for now"
+        )
+        defer {
+            pair.server.disconnect()
+        }
+
+        // Tear down the client — this should send the sign-off first.
+        pair.client.disconnect()
+
+        // Server should see the sign-off message.
+        try await Self.waitUntil(timeout: 3.0) {
+            pair.server.chatMessages.contains { msg in
+                msg.kind == .message
+                    && !msg.outgoing
+                    && msg.sStation == "W9FYI"
+                    && msg.text == "W9FYI signing off for now"
+            }
+        }
+    }
+
+    @Test("Sign-off is NOT sent when already disconnected")
+    func signOffSkippedWhenDisconnected() async throws {
+        let pair = try await Self.makePairWithClientSignMessages(
+            signOn: "",
+            signOff: "should not arrive"
+        )
+        defer {
+            pair.server.disconnect()
+        }
+
+        // First disconnect — sends nothing because signOff is
+        // configured but... wait, it IS configured. This test should
+        // verify that the SECOND disconnect call (when already
+        // disconnected) doesn't resend. Let me restructure.
+        pair.client.disconnect()
+        try await Task.sleep(nanoseconds: 300_000_000)
+
+        // Reset the server's chat log counter. We'll count new
+        // messages after this point.
+        let messagesBeforeSecondDisconnect = pair.server.chatMessages.count
+
+        // Second disconnect call while already disconnected — must
+        // not re-send the sign-off.
+        pair.client.disconnect()
+        try await Task.sleep(nanoseconds: 300_000_000)
+
+        let messagesAfterSecondDisconnect = pair.server.chatMessages.count
+        #expect(messagesBeforeSecondDisconnect == messagesAfterSecondDisconnect,
+                "second disconnect() must not re-send the sign-off")
     }
 }

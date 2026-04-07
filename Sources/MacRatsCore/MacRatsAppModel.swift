@@ -228,13 +228,70 @@ public final class MacRatsAppModel: @unchecked Sendable {
     }
 
     /// Disconnect the current session, if any. Idempotent.
+    ///
+    /// Sends the configured sign-off message (if any) on the existing
+    /// connection BEFORE tearing it down. If the connection is already
+    /// dead this send is silently skipped.
     public func disconnect() {
+        sendSignOffIfNeeded()
         manager?.disconnect()
         manager = nil
         chatSession = nil
         chatDelegateShim = nil
         setConnectionStatus(.disconnected)
         append(systemEvent: "Disconnected.")
+    }
+
+    /// Send the configured sign-on chat message as a CQCQCQ broadcast,
+    /// if one is configured and we have an open chat session. Called
+    /// once automatically when the transport transitions to
+    /// `.connected`.
+    private func sendSignOnIfNeeded() {
+        let text = snapshot().settings.signOnMessage
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        guard let chatSession else { return }
+        do {
+            try chatSession.sendMessage(text, to: "CQCQCQ")
+            let myCall = snapshot().settings.callsign
+            append(ChatMessage(kind: .message,
+                               sStation: myCall,
+                               dStation: "CQCQCQ",
+                               text: text,
+                               outgoing: true))
+        } catch {
+            log("sign-on send failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Send the configured sign-off chat message as a CQCQCQ broadcast,
+    /// if one is configured and we have an open chat session. Called
+    /// once from `disconnect()` BEFORE the transport is torn down.
+    private func sendSignOffIfNeeded() {
+        // Only attempt if we're actually connected — otherwise the
+        // manager.send() call will error out and we have nothing to
+        // say anyway.
+        guard _connectionStatus == .connected else { return }
+        let text = snapshot().settings.signOffMessage
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        guard let chatSession else { return }
+        do {
+            try chatSession.sendMessage(text, to: "CQCQCQ")
+            let myCall = snapshot().settings.callsign
+            append(ChatMessage(kind: .message,
+                               sStation: myCall,
+                               dStation: "CQCQCQ",
+                               text: text,
+                               outgoing: true))
+            // Small delay so the bytes actually reach the transport
+            // layer before we cancel the underlying socket. For TCP
+            // this matters because cancel() short-circuits any queued
+            // outbound data in the NWConnection.
+            Thread.sleep(forTimeInterval: 0.15)
+        } catch {
+            log("sign-off send failed: \(error.localizedDescription)")
+        }
     }
 
     // MARK: - Chat intents
@@ -336,10 +393,20 @@ public final class MacRatsAppModel: @unchecked Sendable {
     }
 
     private func setConnectionStatus(_ status: TransportStatus) {
+        let previousStatus: TransportStatus
         lock.lock()
+        previousStatus = _connectionStatus
         _connectionStatus = status
         lock.unlock()
         notifyObservers()
+
+        // Fire the sign-on broadcast on the rising edge into .connected.
+        // A direct equality check would miss the case where we go from
+        // .connecting to .connected (which is the normal path), so we
+        // fire whenever previous != .connected AND new == .connected.
+        if previousStatus != .connected, status == .connected {
+            sendSignOnIfNeeded()
+        }
     }
 
     private func append(_ message: ChatMessage) {

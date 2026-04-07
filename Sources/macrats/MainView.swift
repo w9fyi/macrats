@@ -16,6 +16,17 @@ struct MainView: View {
     @EnvironmentObject private var store: MacRatsStore
     @State private var selectedStationID: String?
 
+    // "My Status" runtime state (not persisted — resets to .online
+    // every launch, matching D-Rats's behavior).
+    @State private var myStatus: StationStatus = .online
+    @State private var myStatusMessage: String = ""
+    @State private var statusPopoverPresented: Bool = false
+
+    // First-run setup wizard — shown when the user has never set a
+    // callsign. Bound to a @State so the Cancel/Finish of the sheet
+    // re-evaluates correctly.
+    @State private var setupWizardPresented: Bool = false
+
     var body: some View {
         NavigationSplitView {
             StationsView(selection: $selectedStationID)
@@ -28,6 +39,8 @@ struct MainView: View {
                 connectionStatusIndicator
             }
             ToolbarItemGroup(placement: .primaryAction) {
+                statusButton
+
                 Button(action: togglePing) {
                     Label("Ping Selected", systemImage: "bolt.horizontal")
                 }
@@ -53,6 +66,58 @@ struct MainView: View {
         } message: {
             Text(store.lastErrorMessage ?? "")
         }
+        .sheet(isPresented: $setupWizardPresented) {
+            SetupWizard(initialSettings: store.settings)
+                .environmentObject(store)
+                .interactiveDismissDisabled()
+        }
+        .onAppear {
+            // Show the first-run wizard if the user has no callsign
+            // configured yet. Delayed by one run loop so the main
+            // window has time to come up first.
+            if store.settings.callsign.isEmpty {
+                DispatchQueue.main.async {
+                    setupWizardPresented = true
+                }
+            }
+        }
+    }
+
+    // MARK: - My Status toolbar button
+
+    @ViewBuilder
+    private var statusButton: some View {
+        Button {
+            statusPopoverPresented = true
+        } label: {
+            Label("My Status: \(myStatus.description)", systemImage: statusSystemImage)
+        }
+        .help("Set your broadcast status — Online, Unattended, or Offline, with an optional message.")
+        .accessibilityLabel("My status, currently \(myStatus.description)\(myStatusMessage.isEmpty ? "" : ", message: \(myStatusMessage)")")
+        .disabled(store.connectionStatus != .connected)
+        .popover(isPresented: $statusPopoverPresented, arrowEdge: .bottom) {
+            StatusPopover(
+                status: $myStatus,
+                message: $myStatusMessage,
+                onBroadcast: { broadcastMyStatus() }
+            )
+            .frame(width: 320)
+            .padding()
+        }
+    }
+
+    private var statusSystemImage: String {
+        switch myStatus {
+        case .online:     return "circle.fill"
+        case .unattended: return "moon.circle"
+        case .offline:    return "circle.slash"
+        case .unknown:    return "questionmark.circle"
+        }
+    }
+
+    private func broadcastMyStatus() {
+        store.broadcastStatus(myStatus, message: myStatusMessage)
+        statusPopoverPresented = false
     }
 
     // MARK: - Status indicator
