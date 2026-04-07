@@ -19,6 +19,10 @@ let package = Package(
             name: "macrats-probe",
             targets: ["macrats-probe"]
         ),
+        .executable(
+            name: "macrats-chat",
+            targets: ["macrats-chat"]
+        ),
     ],
     targets: [
         .target(
@@ -30,6 +34,10 @@ let package = Package(
         ),
         .executableTarget(
             name: "macrats-probe",
+            dependencies: ["MacRatsCore"]
+        ),
+        .executableTarget(
+            name: "macrats-chat",
             dependencies: ["MacRatsCore"]
         ),
         .testTarget(

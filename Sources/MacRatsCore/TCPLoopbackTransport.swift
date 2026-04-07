@@ -115,7 +115,14 @@ public final class TCPLoopbackTransport: RadioTransport, @unchecked Sendable {
                 self.notifyError(error)
                 self.setStatus(.failed("listener failed: \(error.localizedDescription)"))
             case .cancelled:
-                self.setStatus(.disconnected)
+                // DO NOT flip transport status to .disconnected here — we
+                // deliberately cancel the listener the moment we accept the
+                // first connection (`newConnectionHandler` below), and a
+                // naive "cancel → disconnected" transition would fire just
+                // after `attach()` has set `.connected`, producing an
+                // immediate false disconnect. The real disconnect path
+                // runs from the accepted connection's own cancel handler.
+                break
             default:
                 break
             }
