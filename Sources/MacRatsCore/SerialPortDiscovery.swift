@@ -14,6 +14,16 @@ public enum SerialPortDiscovery {
         case usbSerial    // /dev/cu.usbserial*, /dev/cu.SLAB_USBtoUART* — FTDI, SiLabs
         case bluetooth    // /dev/cu.TH-D75, /dev/cu.<name>-SerialPort, /dev/cu.Bluetooth-*
         case other        // anything else (debug-console, loopback, etc.)
+
+        /// Short human label used in UI pickers.
+        public var displayName: String {
+            switch self {
+            case .usbModem:  return "USB"
+            case .usbSerial: return "USB-Serial"
+            case .bluetooth: return "Bluetooth"
+            case .other:     return "Other"
+            }
+        }
     }
 
     /// A discovered serial port.

@@ -4,7 +4,7 @@ import PackageDescription
 let package = Package(
     name: "MacRatsCore",
     platforms: [
-        .macOS(.v13)
+        .macOS(.v14)
     ],
     products: [
         .library(
@@ -23,6 +23,10 @@ let package = Package(
             name: "macrats-chat",
             targets: ["macrats-chat"]
         ),
+        .executable(
+            name: "macrats",
+            targets: ["macrats"]
+        ),
     ],
     targets: [
         .target(
@@ -38,6 +42,10 @@ let package = Package(
         ),
         .executableTarget(
             name: "macrats-chat",
+            dependencies: ["MacRatsCore"]
+        ),
+        .executableTarget(
+            name: "macrats",
             dependencies: ["MacRatsCore"]
         ),
         .testTarget(

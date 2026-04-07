@@ -1,0 +1,406 @@
+import Foundation
+
+/// The keystone view-model for the MacRats SwiftUI app.
+///
+/// Owns the `SessionManager`, tracks heard stations, accumulates the
+/// chat log, holds the current `MacRatsSettings`, and exposes high-level
+/// intents the UI calls (`connect()`, `sendChatMessage(_:to:)`,
+/// `pingStation(_:)`, etc.).
+///
+/// Intentionally does NOT import SwiftUI — all SwiftUI views consume
+/// this model via `@ObservedObject` from their own files in the app
+/// target. Keeping SwiftUI out of MacRatsCore lets this be tested with
+/// the Swift Testing framework under `swift test` without any UI
+/// runtime.
+///
+/// This class is `@unchecked Sendable` because:
+///
+/// - Its mutable state (`chatMessages`, `stations`, `settings`,
+///   `connectionStatus`) is only written while holding the internal
+///   `NSLock`.
+/// - The observation callback (`onStateChanged`) is invoked synchronously
+///   while the lock is held but only AFTER the state has been updated —
+///   UI layers are expected to hop to the main actor themselves before
+///   reading the published snapshots via `snapshot()`.
+public final class MacRatsAppModel: @unchecked Sendable {
+
+    // MARK: - Observation
+
+    /// Callback fired after ANY state change (new chat message, station
+    /// update, settings change, connection status change). SwiftUI views
+    /// wrap this in a Combine publisher or `@ObservedObject` shim in
+    /// their own file.
+    public var onStateChanged: (@Sendable () -> Void)?
+
+    /// Log callback for diagnostic output. If nil, messages are silently
+    /// dropped. SwiftUI wires this to a rolling buffer the debug view
+    /// can display.
+    public var logHandler: (@Sendable (String) -> Void)?
+
+    // MARK: - Persisted + runtime state
+
+    private let lock = NSLock()
+
+    private var _settings: MacRatsSettings
+    private let stationTracker: HeardStationTracker
+    private var _chatMessages: [ChatMessage] = []
+    private var _connectionStatus: TransportStatus = .disconnected
+    private let maxChatHistory: Int
+
+    // MARK: - Session plumbing
+
+    private var manager: SessionManager?
+    private var chatSession: ChatSession?
+    private var chatDelegateShim: ChatDelegateShim?
+
+    /// Where settings are persisted. Injected for testability.
+    public let settingsURL: URL?
+
+    // MARK: - Init
+
+    public init(settings: MacRatsSettings = MacRatsSettings(),
+                settingsURL: URL? = nil,
+                maxChatHistory: Int = 500) {
+        self._settings = settings
+        self.settingsURL = settingsURL
+        self.maxChatHistory = maxChatHistory
+        self.stationTracker = HeardStationTracker()
+    }
+
+    /// Convenience: load settings from disk (or defaults) and build the
+    /// model ready to connect.
+    public static func loadFromDisk() -> MacRatsAppModel {
+        let loaded = MacRatsSettings.load()
+        return MacRatsAppModel(settings: loaded)
+    }
+
+    // MARK: - Public snapshots (thread-safe reads)
+
+    /// Atomic snapshot of everything the UI might want to show.
+    public struct Snapshot: Sendable {
+        public let settings: MacRatsSettings
+        public let connectionStatus: TransportStatus
+        public let chatMessages: [ChatMessage]
+        public let stations: [HeardStation]
+    }
+
+    public func snapshot() -> Snapshot {
+        lock.lock()
+        let settings = _settings
+        let status = _connectionStatus
+        let messages = _chatMessages
+        lock.unlock()
+        let stations = stationTracker.sortedSnapshot()
+        return Snapshot(settings: settings,
+                        connectionStatus: status,
+                        chatMessages: messages,
+                        stations: stations)
+    }
+
+    /// Current settings (for config sheets).
+    public var settings: MacRatsSettings {
+        lock.lock()
+        defer { lock.unlock() }
+        return _settings
+    }
+
+    /// Current transport status.
+    public var connectionStatus: TransportStatus {
+        lock.lock()
+        defer { lock.unlock() }
+        return _connectionStatus
+    }
+
+    /// Current chat log.
+    public var chatMessages: [ChatMessage] {
+        lock.lock()
+        defer { lock.unlock() }
+        return _chatMessages
+    }
+
+    /// Current heard-stations list, most recent first.
+    public var heardStations: [HeardStation] {
+        stationTracker.sortedSnapshot()
+    }
+
+    // MARK: - Settings management
+
+    /// Replace settings. Disconnects if the connection-related fields
+    /// changed, so the next `connect()` picks up the new config.
+    public func updateSettings(_ newSettings: MacRatsSettings) {
+        var needsDisconnect = false
+        lock.lock()
+        let old = _settings
+        if old.connectionKind != newSettings.connectionKind
+            || old.serialDevicePath != newSettings.serialDevicePath
+            || old.serialBaudRate != newSettings.serialBaudRate
+            || old.tcpHost != newSettings.tcpHost
+            || old.tcpPort != newSettings.tcpPort {
+            needsDisconnect = true
+        }
+        _settings = newSettings
+        lock.unlock()
+
+        if needsDisconnect {
+            disconnect()
+        }
+
+        // Update the chat session's ping reply text if it's live.
+        if let chatSession {
+            chatSession.pingReplyText = newSettings.pingReplyText
+        }
+
+        // Persist.
+        do {
+            try newSettings.save(to: settingsURL)
+        } catch {
+            log("failed to save settings: \(error.localizedDescription)")
+        }
+
+        notifyObservers()
+    }
+
+    // MARK: - Connection lifecycle
+
+    /// Build a transport from the current settings and connect it.
+    /// Throws if settings are invalid. Idempotent — calling while already
+    /// connected is a no-op.
+    public func connect() throws {
+        lock.lock()
+        if _connectionStatus == .connected || _connectionStatus == .connecting {
+            lock.unlock()
+            return
+        }
+        let settings = _settings
+        lock.unlock()
+
+        if let error = settings.connectionValidationError() {
+            log("connect refused: \(error)")
+            throw SessionError.notAttachedToManager // placeholder; UI reads the validation error separately
+        }
+
+        let transport: RadioTransport
+        switch settings.connectionKind {
+        case .disconnected:
+            throw SessionError.notAttachedToManager
+        case .serial:
+            transport = USBSerialTransport(devicePath: settings.serialDevicePath,
+                                           baudRate: settings.serialBaudRate)
+        case .tcpLoopback:
+            if settings.tcpHost.isEmpty {
+                transport = TCPLoopbackTransport(mode: .server(port: settings.tcpPort))
+            } else {
+                transport = TCPLoopbackTransport(mode: .client(host: settings.tcpHost,
+                                                               port: settings.tcpPort))
+            }
+        case .tcpRatflector:
+            transport = TCPLoopbackTransport(mode: .client(host: settings.tcpHost,
+                                                           port: settings.tcpPort))
+        }
+
+        let manager = SessionManager(callsign: settings.callsign, transport: transport)
+        let chat = ChatSession(pingReplyText: settings.pingReplyText)
+        let shim = ChatDelegateShim(owner: self)
+        chat.delegate = shim
+        manager.add(chat, id: 1)
+
+        manager.logHandler = { [weak self] msg in
+            self?.log(msg)
+            self?.handleTransportLogMessage(msg)
+        }
+        manager.onInboundFrame = { [weak self] frame in
+            self?.stationTracker.note(from: frame.sStation)
+            self?.notifyObservers()
+        }
+
+        self.manager = manager
+        self.chatSession = chat
+        self.chatDelegateShim = shim
+
+        do {
+            try manager.connect()
+            append(systemEvent: "Connecting to \(settings.connectionKind.displayName)…")
+        } catch {
+            setConnectionStatus(.failed(error.localizedDescription))
+            append(systemEvent: "Connect failed: \(error.localizedDescription)")
+            throw error
+        }
+    }
+
+    /// Disconnect the current session, if any. Idempotent.
+    public func disconnect() {
+        manager?.disconnect()
+        manager = nil
+        chatSession = nil
+        chatDelegateShim = nil
+        setConnectionStatus(.disconnected)
+        append(systemEvent: "Disconnected.")
+    }
+
+    // MARK: - Chat intents
+
+    /// Send a chat message to the given destination (CQCQCQ by default).
+    public func sendChatMessage(_ text: String, to dest: String = "CQCQCQ") throws {
+        guard let chatSession else {
+            throw SessionError.notAttachedToManager
+        }
+        try chatSession.sendMessage(text, to: dest)
+
+        // Echo locally so the user sees their own message in the log.
+        let myCall = snapshot().settings.callsign
+        append(ChatMessage(kind: .message,
+                           sStation: myCall,
+                           dStation: dest,
+                           text: text,
+                           outgoing: true))
+    }
+
+    /// Ping another station.
+    public func pingStation(_ callsign: String) throws {
+        guard let chatSession else {
+            throw SessionError.notAttachedToManager
+        }
+        try chatSession.pingStation(callsign)
+        let myCall = snapshot().settings.callsign
+        append(ChatMessage(kind: .pingRequest,
+                           sStation: myCall,
+                           dStation: callsign,
+                           text: "Ping",
+                           outgoing: true))
+    }
+
+    /// Broadcast our current station status.
+    public func broadcastStatus(_ status: StationStatus, message: String) throws {
+        guard let chatSession else {
+            throw SessionError.notAttachedToManager
+        }
+        chatSession.currentStatus = status
+        chatSession.currentStatusMessage = message
+        try chatSession.advertise(status: status, message: message)
+    }
+
+    // MARK: - Internal state transitions
+
+    fileprivate func handleIncomingMessage(_ text: String, from sStation: String, to dStation: String) {
+        stationTracker.noteMessage(from: sStation)
+        append(ChatMessage(kind: .message,
+                           sStation: sStation,
+                           dStation: dStation,
+                           text: text,
+                           outgoing: false))
+    }
+
+    fileprivate func handleIncomingPingRequest(from sStation: String, to dStation: String) {
+        stationTracker.notePing(from: sStation)
+        append(ChatMessage(kind: .pingRequest,
+                           sStation: sStation,
+                           dStation: dStation,
+                           text: "Ping request",
+                           outgoing: false))
+    }
+
+    fileprivate func handleIncomingPingResponse(from sStation: String, to dStation: String, replyText: String) {
+        stationTracker.notePing(from: sStation)
+        append(ChatMessage(kind: .pingResponse(replyText: replyText),
+                           sStation: sStation,
+                           dStation: dStation,
+                           text: replyText,
+                           outgoing: false))
+    }
+
+    fileprivate func handleIncomingStatus(from sStation: String, status: StationStatus, message: String) {
+        stationTracker.noteStatus(from: sStation, status: status, message: message)
+        append(ChatMessage(kind: .status(status),
+                           sStation: sStation,
+                           dStation: "CQCQCQ",
+                           text: message,
+                           outgoing: false))
+    }
+
+    private func handleTransportLogMessage(_ message: String) {
+        // Best-effort parsing of the manager's log strings to update
+        // our connection status. The manager emits "transport status: X"
+        // for every state change.
+        if message.hasPrefix("transport status: ") {
+            let state = String(message.dropFirst("transport status: ".count))
+            switch state {
+            case "connected":    setConnectionStatus(.connected)
+            case "connecting":   setConnectionStatus(.connecting)
+            case "disconnected": setConnectionStatus(.disconnected)
+            default:
+                if state.hasPrefix("failed") {
+                    setConnectionStatus(.failed(state))
+                }
+            }
+        }
+    }
+
+    private func setConnectionStatus(_ status: TransportStatus) {
+        lock.lock()
+        _connectionStatus = status
+        lock.unlock()
+        notifyObservers()
+    }
+
+    private func append(_ message: ChatMessage) {
+        lock.lock()
+        _chatMessages.append(message)
+        if _chatMessages.count > maxChatHistory {
+            _chatMessages.removeFirst(_chatMessages.count - maxChatHistory)
+        }
+        lock.unlock()
+        notifyObservers()
+    }
+
+    private func append(systemEvent text: String) {
+        append(ChatMessage(kind: .systemEvent,
+                           sStation: "",
+                           dStation: "",
+                           text: text,
+                           outgoing: false))
+    }
+
+    private func notifyObservers() {
+        onStateChanged?()
+    }
+
+    private func log(_ message: String) {
+        logHandler?(message)
+    }
+}
+
+// MARK: - Chat delegate shim
+
+/// Private shim — `ChatSession.Delegate` must be a class and `MacRatsAppModel`
+/// is a class, but making the model conform to `Delegate` directly would
+/// pollute its public API with the delegate method signatures. A thin
+/// shim keeps the model's API clean.
+private final class ChatDelegateShim: ChatSession.Delegate, @unchecked Sendable {
+    weak var owner: MacRatsAppModel?
+
+    init(owner: MacRatsAppModel) {
+        self.owner = owner
+    }
+
+    func chatSession(_ session: ChatSession, didReceiveMessage text: String, from sStation: String, to dStation: String) {
+        owner?.handleIncomingMessage(text, from: sStation, to: dStation)
+    }
+
+    func chatSession(_ session: ChatSession, didReceivePingRequest from: String, to dStation: String) {
+        owner?.handleIncomingPingRequest(from: from, to: dStation)
+    }
+
+    func chatSession(_ session: ChatSession, didReceivePingResponse from: String, to dStation: String, replyText: String) {
+        owner?.handleIncomingPingResponse(from: from, to: dStation, replyText: replyText)
+    }
+
+    func chatSession(_ session: ChatSession, didReceiveEchoRequest from: String, to dStation: String, payload: Data) {
+        // v1.0 doesn't surface echo in the UI; v1.1 can add this.
+    }
+
+    func chatSession(_ session: ChatSession, didReceiveEchoResponse from: String, to dStation: String, payload: Data) {}
+
+    func chatSession(_ session: ChatSession, didReceiveStationStatus from: String, status: StationStatus, message: String) {
+        owner?.handleIncomingStatus(from: from, status: status, message: message)
+    }
+}
