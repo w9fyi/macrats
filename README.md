@@ -29,13 +29,13 @@ MacRats is **not** a fork of D-Rats. It is a clean-room implementation of the DD
 - ✅ VoiceOver-first throughout: single-sentence row labels, `@FocusState` autofocus, live-region announcements for notice matches, `NSAccessibilityEnabled=true` in the bundle
 - ✅ Ad-hoc signed `.app` bundle produced by `scripts/make-app-bundle.sh`
 - ✅ **Phase 1 over-the-air test passed** — 17 byte-perfect DDT2 frames transmitted over 446.100 MHz simplex, verified by a second receiver hearing the D-STAR digital signal
-- ✅ Upstream accessibility issue filed at [ham-radio-software/D-Rats#315](https://github.com/ham-radio-software/D-Rats/issues/315)
+- ✅ **Ratflector (Internet) connections** — `RatflectorTransport` performs the D-Rats authentication handshake (`100 Authentication not required` / `101` + `USER`/`PASS` flow with `102`/`200`/`500` response codes), falls back to "old-school" mode on servers that don't send a banner, and integrates with the public ratflector directory fetched from `ham-radio-software/ratflectors`. Live-tested against `sewx.ratflector.com`.
+- ✅ Upstream accessibility issue filed at [ham-radio-software/D-Rats#315](https://github.com/ham-radio-software/D-Rats/issues/315) + TH-D75 configuration recipe contributed as [#316](https://github.com/ham-radio-software/D-Rats/issues/316)
 
 ### Planned
 
 - ⬜ Phase 3 — receive-side test against a second D-Rats-compatible station (needs a peer)
 - ⬜ Bluetooth SPP transport (v1.1 — needs `BluetoothCoordinator` to bring up RFCOMM channel 2)
-- ⬜ Ratflector (Internet) connections (v1.1)
 - ⬜ Events tab + sound alerts (v1.1)
 - ⬜ Map view with MapKit + offline tiles (v1.2)
 - ⬜ File transfer sessions, structured form messages, Winlink (v1.2+ — see `memory/macrats_feature_parity.md` for the full matrix)
@@ -43,7 +43,7 @@ MacRats is **not** a fork of D-Rats. It is a clean-room implementation of the DD
 ## Test status
 
 ```text
-162 tests, 17 suites, all passing in ~3 seconds.
+192 tests, 19 suites, all passing in ~3 seconds.
 ```
 
 - Every golden vector from upstream Python D-Rats is reproduced byte-for-byte
@@ -51,7 +51,10 @@ MacRats is **not** a fork of D-Rats. It is a clean-room implementation of the DD
 - `ChatLogStore` round-trips every `ChatMessage.Kind`, handles corruption, rotates automatically
 - `WarmupFrameTests` (11 tests) verify the D-Rats warmup frame behavior end-to-end
 - `WireLoggerTests` (11 tests) verify the bench-debugging log file
+- `RatflectorHandshakeTests` (13 tests) cover every branch of the text-based auth flow (code 100, 101→200, 101→102→200, 101→500, timeout→old-school, EOF→old-school, unknown code, missing callsign, missing password, rejected password, etc.)
+- `RatflectorDirectoryTests` (17 tests) including the real captured `ratflectors.yml` fixture
 - **Live on-air test passed** against a real Kenwood TH-D75 on 446.100 MHz simplex D-STAR (2026-04-07)
+- **Live Internet test passed** against `sewx.ratflector.com:9000` — handshake, broadcast send, clean disconnect (2026-04-07)
 
 ## Why a Swift rewrite
 
@@ -101,6 +104,54 @@ This is undocumented in the TH-D75 user manual, the IDM (Instruction Data Manual
 
 If you're configuring a TH-D75 for any D-Rats-compatible client (MacRats, upstream D-Rats on Linux, or something else), **check Menu 614 first if the radio refuses to transmit.** This has a good chance of being the answer.
 
+## Connecting to a ratflector (no radio needed)
+
+A **ratflector** is a public D-Rats server on the Internet that relays chat, pings, and status messages between connected clients. Point MacRats at one and you can talk to other D-Rats users from your couch with no radio at all. This is the easiest way to try MacRats if you don't have a D-STAR HT handy, or to test against real peers before taking things to the air.
+
+### In the app
+
+1. Open Preferences (`⌘,`) → Radio tab
+2. Set **Connection type** to **Ratflector (Internet)**
+3. The **Public ratflector** picker loads the directory from [ham-radio-software/ratflectors](https://github.com/ham-radio-software/ratflectors) automatically the first time you switch to this mode. Click **Refresh** to re-fetch the list.
+4. Pick a ratflector — MacRats fills in the host and port for you
+5. Leave the password field blank unless the operator of a specific ratflector gave you one (most public ratflectors accept anonymous connections)
+6. Close Preferences and press `⌘K` to connect
+
+The connection status indicator turns green when MacRats has completed the ratflector's authentication handshake. Any chat messages you type go to all other users currently connected to the same ratflector. Incoming messages from other users appear in your chat log and populate the stations sidebar.
+
+### From the CLI (`macrats-chat`)
+
+```bash
+macrats-chat --callsign AI5OS --ratflector sewx.ratflector.com
+macrats-chat --callsign AI5OS --ratflector sewx.ratflector.com:9000
+```
+
+Then type a message and hit Return. The CLI REPL supports `/ping <callsign>`, `/status <online|unattended|offline> <message>`, and `/quit`.
+
+### What the handshake actually does
+
+Most public ratflectors are anonymous and MacRats's handshake completes in one round-trip:
+
+```text
+Server → Client:  "100 Authentication not required\r\n"
+(handshake done, DDT2 frames flow)
+```
+
+For private ratflectors that require authentication, the full flow is:
+
+```text
+Server → Client:  "101 Authorization required\r\n"
+Client → Server:  "USER AI5OS\r\n"
+Server → Client:  "102 Password required\r\n"
+Client → Server:  "PASS <password>\r\n"
+Server → Client:  "200 Welcome\r\n"
+(handshake done, DDT2 frames flow)
+```
+
+If the server sends no banner at all (pre-handshake legacy ratflectors), MacRats falls through to "old-school" mode after a 5-second timeout and proceeds to send/receive DDT2 frames without any handshake — matching upstream D-Rats's fallback behavior exactly.
+
+**No encryption** — ratflector traffic is plaintext TCP. Treat it like a public ham radio channel, because that's functionally what it is.
+
 ## Building and running
 
 ### Build everything with SwiftPM
@@ -127,7 +178,7 @@ Three executables are built alongside the app, useful for testing and debugging:
 
 - **`macrats-sniff <device>`** — read-only serial sniffer. Opens a `/dev/cu.*` device and prints any bytes it receives, attempting to decode DDT2 envelopes. Safe with an idle radio.
 - **`macrats-probe <device>`** — identifies what's on the other end of a serial port by sending a Kenwood `ID\r` probe and an MMDVM `getVersion` probe. Use this to confirm which USB port is your TH-D75 and whether it's in normal CAT or terminal mode.
-- **`macrats-chat --callsign <CALL> --server <PORT> | --client <HOST> <PORT> | --serial <DEVICE>`** — interactive chat REPL. Run two instances on localhost with `--server` and `--client` to exercise the full protocol stack without a radio.
+- **`macrats-chat --callsign <CALL> --server <PORT> | --client <HOST> <PORT> | --serial <DEVICE> | --ratflector <HOST[:PORT]>`** — interactive chat REPL. Run two instances on localhost with `--server` and `--client` to exercise the full protocol stack without a radio, or `--ratflector sewx.ratflector.com` to talk to real D-Rats users on the public Internet.
 
 ### Quickstart: talk to yourself over TCP loopback
 

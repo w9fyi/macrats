@@ -69,6 +69,18 @@ struct ChatCLI {
                 if i < args.count {
                     mode = .serial(path: args[i])
                 }
+            case "--ratflector":
+                i += 1
+                if i < args.count {
+                    // Accept either "host:port" or just "host" (default port 9000).
+                    let spec = args[i]
+                    if let colonIdx = spec.firstIndex(of: ":"),
+                       let port = UInt16(spec[spec.index(after: colonIdx)...]) {
+                        mode = .ratflector(host: String(spec[..<colonIdx]), port: port)
+                    } else {
+                        mode = .ratflector(host: spec, port: 9000)
+                    }
+                }
             case "--baud":
                 i += 1
                 if i < args.count, let b = Int32(args[i]) { baud = b }
@@ -88,7 +100,7 @@ struct ChatCLI {
             exit(2)
         }
         guard let mode else {
-            print("ERROR: must specify --server, --client, or --serial")
+            print("ERROR: must specify --server, --client, --serial, or --ratflector")
             exit(2)
         }
 
@@ -108,6 +120,14 @@ struct ChatCLI {
             transport = TCPLoopbackTransport(mode: .client(host: host, port: port))
         case .serial(let path):
             transport = USBSerialTransport(devicePath: path, baudRate: baud)
+        case .ratflector(let host, let port):
+            transport = RatflectorTransport(
+                host: host,
+                port: port,
+                callsign: callsign,
+                password: nil,
+                handshakeTimeoutSeconds: 5
+            )
         }
 
         let manager = SessionManager(callsign: callsign, transport: transport)
@@ -209,11 +229,14 @@ Usage:
   macrats-chat --callsign <CALL> --server <PORT>
   macrats-chat --callsign <CALL> --client <HOST> <PORT>
   macrats-chat --callsign <CALL> --serial <DEVICE> [--baud <RATE>]
+  macrats-chat --callsign <CALL> --ratflector <HOST[:PORT]>
 
 Examples:
   macrats-chat --callsign AI5OS --server 9999
   macrats-chat --callsign W9FYI --client 127.0.0.1 9999
   macrats-chat --callsign AI5OS --serial /dev/cu.usbmodem2011201 --baud 9600
+  macrats-chat --callsign AI5OS --ratflector sewx.ratflector.com
+  macrats-chat --callsign AI5OS --ratflector sewx.ratflector.com:9000
 """)
     }
 
@@ -229,12 +252,14 @@ enum Mode: Sendable {
     case server(port: UInt16)
     case client(host: String, port: UInt16)
     case serial(path: String)
+    case ratflector(host: String, port: UInt16)
 
     var description: String {
         switch self {
-        case .server(let port):          return "TCP listen :\(port)"
-        case .client(let host, let port): return "TCP connect \(host):\(port)"
-        case .serial(let path):          return "Serial \(path)"
+        case .server(let port):                return "TCP listen :\(port)"
+        case .client(let host, let port):      return "TCP connect \(host):\(port)"
+        case .serial(let path):                return "Serial \(path)"
+        case .ratflector(let host, let port):  return "Ratflector \(host):\(port)"
         }
     }
 }

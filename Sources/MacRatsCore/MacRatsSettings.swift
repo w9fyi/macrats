@@ -48,11 +48,29 @@ public struct MacRatsSettings: Codable, Equatable, Sendable {
     /// Serial baud rate. TH-D75 normal mode: 9600. Terminal mode: 38400.
     public var serialBaudRate: Int32 = 9600
 
-    /// Host for `.tcpRatflector` / `.tcpLoopback` client mode. v1.1.
+    /// Host for `.tcpRatflector` / `.tcpLoopback` client mode.
     public var tcpHost: String = ""
 
     /// Port for `.tcpRatflector` / `.tcpLoopback` client or server mode.
     public var tcpPort: UInt16 = 9000
+
+    /// Optional ratflector password. Only used if the ratflector
+    /// server's handshake returns code 101 (auth required) AND the
+    /// server subsequently returns code 102 (password required) after
+    /// we send `USER <callsign>`. Most public ratflectors do not
+    /// require a password — leave this blank for those.
+    ///
+    /// NOT currently encrypted in `settings.json` on disk; matches
+    /// the upstream D-Rats convention of storing passwords plaintext
+    /// in the config file. If this becomes a concern in v1.1,
+    /// migrate it to the Keychain.
+    public var ratflectorPassword: String = ""
+
+    /// Free-text label for the currently-selected ratflector (e.g.
+    /// `"SEWX — Southeastern Weather Net"`). Purely for UI display in
+    /// the connection status indicator and chat log system events —
+    /// not used on the wire. Updated by the ConfigSheet picker.
+    public var ratflectorLabel: String = ""
 
     // MARK: - GPS panel (v1.0)
 

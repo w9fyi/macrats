@@ -234,8 +234,21 @@ public final class MacRatsAppModel: @unchecked Sendable {
                                                                port: settings.tcpPort))
             }
         case .tcpRatflector:
-            transport = TCPLoopbackTransport(mode: .client(host: settings.tcpHost,
-                                                           port: settings.tcpPort))
+            // Ratflector transport runs the text-based authentication
+            // handshake before handing bytes to the DDT2 layer.
+            // Callsign comes from settings; password is optional and
+            // only used if the server responds with code 101 + 102.
+            // Most public ratflectors send code 100 (no auth) and
+            // the password is unused.
+            let ratflectorPassword: String? = settings.ratflectorPassword.isEmpty
+                ? nil
+                : settings.ratflectorPassword
+            transport = RatflectorTransport(
+                host: settings.tcpHost,
+                port: settings.tcpPort,
+                callsign: settings.callsign.isEmpty ? nil : settings.callsign,
+                password: ratflectorPassword
+            )
         }
 
         // Translate settings into the SessionManager's wire-tuning

@@ -160,6 +160,7 @@ struct SetupWizard: View {
 
             Picker("Connection type", selection: $draft.connectionKind) {
                 Text("Serial / USB (to a real radio)").tag(MacRatsSettings.ConnectionKind.serial)
+                Text("Ratflector (Internet, no radio needed)").tag(MacRatsSettings.ConnectionKind.tcpRatflector)
                 Text("Local TCP (for testing with another instance)").tag(MacRatsSettings.ConnectionKind.tcpLoopback)
                 Text("Disconnected (configure later)").tag(MacRatsSettings.ConnectionKind.disconnected)
             }
@@ -171,18 +172,18 @@ struct SetupWizard: View {
                 Text("Best for: Kenwood TH-D75, Icom ID-51, and other radios with a USB or serial data port.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+            case .tcpRatflector:
+                Text("Best for: chatting with other D-Rats users over the Internet without a radio. MacRats will fetch the public ratflector list so you can pick one.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             case .tcpLoopback:
-                Text("Best for: testing two MacRats instances on the same Mac, or connecting to a local ratflector.")
+                Text("Best for: testing two MacRats instances on the same Mac.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             case .disconnected:
                 Text("You can set this up later. MacRats will not be able to send or receive until you do.")
                     .font(.caption)
                     .foregroundStyle(.orange)
-            case .tcpRatflector:
-                Text("Internet ratflector support is planned for v1.1.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
             }
         }
     }

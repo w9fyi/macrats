@@ -90,7 +90,16 @@ struct ConfigSheet: View {
                     Text(kind.displayName).tag(kind)
                 }
             }
-            .onChange(of: working.connectionKind) { _, _ in commit() }
+            .onChange(of: working.connectionKind) { _, _ in
+                commit()
+                // Auto-load the directory the first time the user
+                // switches to ratflector mode.
+                if working.connectionKind == .tcpRatflector,
+                   ratflectorEntries == nil,
+                   !isLoadingRatflectors {
+                    loadRatflectorDirectory()
+                }
+            }
 
             Group {
                 switch working.connectionKind {
@@ -202,15 +211,120 @@ struct ConfigSheet: View {
             .onChange(of: working.tcpPort) { _, _ in commit() }
     }
 
+    // MARK: - Ratflector section
+
+    /// Entries fetched from the public directory. `nil` = not yet
+    /// loaded; empty array = loaded but failed or empty.
+    @State private var ratflectorEntries: [RatflectorDirectory.Entry]? = nil
+    @State private var ratflectorFetchError: String? = nil
+    @State private var isLoadingRatflectors = false
+
     @ViewBuilder
     private var tcpRatflectorSection: some View {
-        Text("Ratflector connections are planned for v1.1.")
+        Text("Ratflectors are D-Rats servers that relay chat over the Internet. Pick one from the public directory, or enter a host manually.")
             .font(.caption)
-            .foregroundStyle(.orange)
-        TextField("Ratflector host", text: $working.tcpHost)
-            .onChange(of: working.tcpHost) { _, _ in commit() }
-        TextField("Port", value: $working.tcpPort, format: .number)
-            .onChange(of: working.tcpPort) { _, _ in commit() }
+            .foregroundStyle(.secondary)
+
+        // Directory picker (from the public upstream YAML list)
+        HStack {
+            Picker("Public ratflector", selection: ratflectorPickerBinding) {
+                Text("— Choose a ratflector —").tag(String?.none)
+                if let ratflectorEntries {
+                    ForEach(ratflectorEntries) { entry in
+                        Text(entry.displayLabel).tag(String?.some(entry.hostname))
+                    }
+                }
+            }
+            .disabled(ratflectorEntries == nil || isLoadingRatflectors)
+            .accessibilityLabel("Public ratflector directory picker")
+            .accessibilityHint("Choose a server from the public D-Rats ratflector directory.")
+
+            Button {
+                loadRatflectorDirectory()
+            } label: {
+                if isLoadingRatflectors {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Label("Refresh", systemImage: "arrow.clockwise")
+                }
+            }
+            .disabled(isLoadingRatflectors)
+            .help("Fetch the public ratflector list from github.com/ham-radio-software/ratflectors")
+            .accessibilityLabel("Refresh ratflector directory")
+        }
+
+        if let error = ratflectorFetchError {
+            Text(error)
+                .font(.caption)
+                .foregroundStyle(.orange)
+        }
+
+        // Manual entry fallback for private / unlisted servers
+        Section {
+            TextField("Ratflector host", text: $working.tcpHost)
+                .onChange(of: working.tcpHost) { _, _ in commit() }
+                .accessibilityHint("DNS name or IP of the ratflector. If you pick from the directory above, this fills in automatically.")
+            TextField("Port", value: $working.tcpPort, format: .number)
+                .onChange(of: working.tcpPort) { _, _ in commit() }
+                .accessibilityHint("TCP port. Default is 9000, which all public ratflectors use.")
+            TextField("Password (only if the ratflector requires auth)", text: $working.ratflectorPassword)
+                .onChange(of: working.ratflectorPassword) { _, _ in commit() }
+                .accessibilityHint("Leave blank unless the ratflector operator gave you a password. Most public ratflectors don't require authentication.")
+        } header: {
+            Text("Manual entry")
+        }
+    }
+
+    /// Two-way binding between the directory picker and the
+    /// underlying `working.tcpHost` + port + label fields. When the
+    /// user picks an entry, we fill in all three; when they type a
+    /// host manually, the picker deselects.
+    private var ratflectorPickerBinding: Binding<String?> {
+        Binding(
+            get: {
+                // Picker shows the currently-set host if it matches
+                // one of the directory entries, otherwise "nothing
+                // selected" so the manual fields are authoritative.
+                if let entries = ratflectorEntries,
+                   entries.contains(where: { $0.hostname == working.tcpHost }) {
+                    return working.tcpHost
+                }
+                return nil
+            },
+            set: { newHost in
+                guard let newHost, let entries = ratflectorEntries,
+                      let entry = entries.first(where: { $0.hostname == newHost }) else {
+                    return
+                }
+                working.tcpHost = entry.hostname
+                working.tcpPort = entry.port
+                working.ratflectorLabel = "\(entry.name) — \(entry.description)"
+                commit()
+            }
+        )
+    }
+
+    /// Kick off a fetch of the ratflector directory. Safe to call
+    /// multiple times; concurrent fetches are deduped via
+    /// `isLoadingRatflectors`.
+    private func loadRatflectorDirectory() {
+        guard !isLoadingRatflectors else { return }
+        isLoadingRatflectors = true
+        ratflectorFetchError = nil
+        Task {
+            do {
+                let entries = try await RatflectorDirectory.fetch()
+                await MainActor.run {
+                    self.ratflectorEntries = entries.filter { $0.active }
+                    self.isLoadingRatflectors = false
+                }
+            } catch {
+                await MainActor.run {
+                    self.ratflectorFetchError = "Failed to load directory: \(error.localizedDescription)"
+                    self.isLoadingRatflectors = false
+                }
+            }
+        }
     }
 
     // MARK: - GPS tab

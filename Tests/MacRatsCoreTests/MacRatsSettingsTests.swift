@@ -46,6 +46,8 @@ struct MacRatsSettingsTests {
         original.warmupTimeoutSeconds = 5
         original.forceDelaySeconds = -2  // random 0..2s
         original.wireLoggingEnabled = true
+        original.ratflectorPassword = "s3cret"
+        original.ratflectorLabel = "sewx — Southeastern Weather Net"
 
         let encoder = JSONEncoder()
         let data = try encoder.encode(original)
