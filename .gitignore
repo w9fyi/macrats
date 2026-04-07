@@ -1,0 +1,12 @@
+.DS_Store
+/.build
+/Packages
+xcuserdata/
+DerivedData/
+.swiftpm/configuration/registries.json
+.swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
+.netrc
+
+# Local copy of upstream Python sources used for porting reference. Lives at
+# ham-radio-software/D-Rats — keep it out of MacRats git history.
+reference/
