@@ -10,3 +10,7 @@ DerivedData/
 # Local copy of upstream Python sources used for porting reference. Lives at
 # ham-radio-software/D-Rats — keep it out of MacRats git history.
 reference/
+
+# Output of scripts/make-app-bundle.sh — the wrapped .app bundle.
+# Rebuilt on demand; never checked in.
+/build/

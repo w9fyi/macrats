@@ -58,20 +58,44 @@ public final class MacRatsAppModel: @unchecked Sendable {
 
     // MARK: - Init
 
+    /// Optional persistent on-disk chat log. `nil` = no persistence
+    /// (useful for tests). When set, new messages are appended to the
+    /// store in real time and `loadHistory()` can repopulate the
+    /// in-memory log from disk on startup.
+    private let chatLogStore: ChatLogStore?
+
     public init(settings: MacRatsSettings = MacRatsSettings(),
                 settingsURL: URL? = nil,
+                chatLogStore: ChatLogStore? = nil,
                 maxChatHistory: Int = 500) {
         self._settings = settings
         self.settingsURL = settingsURL
+        self.chatLogStore = chatLogStore
         self.maxChatHistory = maxChatHistory
         self.stationTracker = HeardStationTracker()
     }
 
-    /// Convenience: load settings from disk (or defaults) and build the
-    /// model ready to connect.
+    /// Convenience: load settings from disk (or defaults), wire up the
+    /// default chat log store under the user's application support
+    /// directory, and repopulate the chat history from disk.
     public static func loadFromDisk() -> MacRatsAppModel {
         let loaded = MacRatsSettings.load()
-        return MacRatsAppModel(settings: loaded)
+        let store = try? ChatLogStore.defaultStore(subdirectory: loaded.chatLogSubdirectory)
+        let model = MacRatsAppModel(settings: loaded, chatLogStore: store)
+        model.loadHistory()
+        return model
+    }
+
+    /// Repopulate the in-memory chat log from the persistent store.
+    /// Safe to call multiple times — each call replaces the history
+    /// with the store's current contents.
+    public func loadHistory() {
+        guard let chatLogStore else { return }
+        let history = chatLogStore.loadRecent()
+        lock.lock()
+        _chatMessages = history
+        lock.unlock()
+        notifyObservers()
     }
 
     // MARK: - Public snapshots (thread-safe reads)
@@ -416,6 +440,8 @@ public final class MacRatsAppModel: @unchecked Sendable {
             _chatMessages.removeFirst(_chatMessages.count - maxChatHistory)
         }
         lock.unlock()
+        // Persist to disk — best-effort, error just logs.
+        chatLogStore?.append(message)
         notifyObservers()
     }
 
