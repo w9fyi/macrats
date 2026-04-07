@@ -169,6 +169,39 @@ struct USBSerialTransportTests {
         #expect(transport.status == .disconnected)
     }
 
+    @Test("isHealthy() returns false before connect and true while connected")
+    func isHealthyStates() async throws {
+        let (masterFD, slavePath) = try Self.makePTYPair()
+        defer { close(masterFD) }
+
+        let transport = USBSerialTransport(devicePath: slavePath, baudRate: 9600)
+        #expect(transport.isHealthy() == false)
+
+        try transport.connect()
+        #expect(transport.isHealthy() == true)
+
+        transport.disconnect()
+        #expect(transport.isHealthy() == false)
+    }
+
+    @Test("isHealthy() flips false when the master end closes the PTY")
+    func isHealthyDetectsMasterClose() async throws {
+        let (masterFD, slavePath) = try Self.makePTYPair()
+
+        let transport = USBSerialTransport(devicePath: slavePath, baudRate: 9600)
+        try transport.connect()
+        #expect(transport.isHealthy() == true)
+
+        // Simulate a radio power-off / USB unplug by closing the master end.
+        // The slave fd will get POLLHUP on the next poll().
+        close(masterFD)
+        // Give the kernel a moment to propagate the state.
+        try await Task.sleep(nanoseconds: 50_000_000)
+        #expect(transport.isHealthy() == false)
+
+        transport.disconnect()
+    }
+
     @Test("End-to-end: pack a DDT2 frame, send through serial, splitter reassembles, decode matches")
     func endToEndDDT2OverSerial() async throws {
         let (masterFD, slavePath) = try Self.makePTYPair()

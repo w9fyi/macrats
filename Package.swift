@@ -15,6 +15,10 @@ let package = Package(
             name: "macrats-sniff",
             targets: ["macrats-sniff"]
         ),
+        .executable(
+            name: "macrats-probe",
+            targets: ["macrats-probe"]
+        ),
     ],
     targets: [
         .target(
@@ -22,6 +26,10 @@ let package = Package(
         ),
         .executableTarget(
             name: "macrats-sniff",
+            dependencies: ["MacRatsCore"]
+        ),
+        .executableTarget(
+            name: "macrats-probe",
             dependencies: ["MacRatsCore"]
         ),
         .testTarget(
