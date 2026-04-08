@@ -163,6 +163,7 @@ public final class MacRatsAppModel: @unchecked Sendable {
         if old.connectionKind != newSettings.connectionKind
             || old.serialDevicePath != newSettings.serialDevicePath
             || old.serialBaudRate != newSettings.serialBaudRate
+            || old.bluetoothRadioAddress != newSettings.bluetoothRadioAddress
             || old.tcpHost != newSettings.tcpHost
             || old.tcpPort != newSettings.tcpPort {
             needsDisconnect = true
@@ -182,7 +183,8 @@ public final class MacRatsAppModel: @unchecked Sendable {
         // Update the session manager's wire tuning live so warmup
         // changes take effect on the next outbound frame. Only applies
         // to serial connections — TCP always uses the NET profile.
-        if let manager, newSettings.connectionKind == .serial {
+        if let manager,
+           newSettings.connectionKind == .serial || newSettings.connectionKind == .bluetooth {
             manager.wireTuning = SessionManager.WireTuning(
                 warmupLength: newSettings.warmupLength,
                 warmupTimeoutSeconds: newSettings.warmupTimeoutSeconds,
@@ -205,7 +207,15 @@ public final class MacRatsAppModel: @unchecked Sendable {
     /// Build a transport from the current settings and connect it.
     /// Throws if settings are invalid. Idempotent — calling while already
     /// connected is a no-op.
-    public func connect() throws {
+    ///
+    /// `bluetoothPortPath` is the `/dev/cu.*` path produced by a live
+    /// `BluetoothCoordinator.bringUpLink(...)` call. The caller is
+    /// responsible for the IOBluetooth bring-up AND for holding the
+    /// coordinator alive for the lifetime of the connection (releasing the
+    /// coordinator's RFCOMM channel reference while connected will tear
+    /// down the cu.* file on the next GC tick). For non-Bluetooth
+    /// connection kinds this parameter is ignored.
+    public func connect(bluetoothPortPath: String? = nil) throws {
         lock.lock()
         if _connectionStatus == .connected || _connectionStatus == .connecting {
             lock.unlock()
@@ -226,6 +236,20 @@ public final class MacRatsAppModel: @unchecked Sendable {
         case .serial:
             transport = USBSerialTransport(devicePath: settings.serialDevicePath,
                                            baudRate: settings.serialBaudRate)
+        case .bluetooth:
+            // Requires the caller to have already brought up the RFCOMM
+            // channel via BluetoothCoordinator and passed us the resolved
+            // /dev/cu.* path. Without that, the cu.* file either does not
+            // exist or is a stale shim that eats bytes.
+            guard let btPath = bluetoothPortPath, !btPath.isEmpty else {
+                log("connect refused: .bluetooth kind but no bluetoothPortPath supplied")
+                throw SessionError.notAttachedToManager
+            }
+            // TH-D75 Bluetooth SPP runs at a fixed 9600 baud on macOS —
+            // the RFCOMM layer is packet-based so baud rate is nominal,
+            // but passing the same value the USB path uses in "normal"
+            // (non-terminal) mode keeps the code path identical.
+            transport = USBSerialTransport(devicePath: btPath, baudRate: 9600)
         case .tcpLoopback:
             if settings.tcpHost.isEmpty {
                 transport = TCPLoopbackTransport(mode: .server(port: settings.tcpPort))
@@ -258,7 +282,7 @@ public final class MacRatsAppModel: @unchecked Sendable {
         // just wasted bytes on the wire.
         let wireTuning: SessionManager.WireTuning
         switch settings.connectionKind {
-        case .serial:
+        case .serial, .bluetooth:
             wireTuning = SessionManager.WireTuning(
                 warmupLength: settings.warmupLength,
                 warmupTimeoutSeconds: settings.warmupTimeoutSeconds,

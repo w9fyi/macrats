@@ -34,6 +34,18 @@ final class MacRatsStore: ObservableObject {
     /// Rolling debug log buffer — populated from `model.logHandler`.
     @Published private(set) var debugLog: [String] = []
 
+    /// Long-lived `BluetoothCoordinator` instance. Held here (not in the
+    /// AppModel) because IOBluetooth is a macOS-only framework and the
+    /// core model is intentionally UI-free. The coordinator's RFCOMM
+    /// channel reference must outlive the `USBSerialTransport` that uses
+    /// the virtual serial port — holding it on the Store (which lives
+    /// for the lifetime of the app) guarantees that.
+    let bluetoothCoordinator = BluetoothCoordinator()
+
+    /// True while a Bluetooth link bring-up is in progress. The UI uses
+    /// this to disable the Connect button and show a progress hint.
+    @Published private(set) var isBringingUpBluetooth = false
+
     init(model: MacRatsAppModel) {
         self.model = model
         self.snapshot = model.snapshot()
@@ -82,16 +94,62 @@ final class MacRatsStore: ObservableObject {
 
     /// Attempt to connect, capturing any thrown error into
     /// `lastErrorMessage` so a SwiftUI alert can display it.
+    ///
+    /// For `.bluetooth` kind this is a two-step process: first bring up
+    /// the IOBluetooth RFCOMM link via `BluetoothCoordinator`, then hand
+    /// the resolved `/dev/cu.*` path to `model.connect(bluetoothPortPath:)`.
+    /// The UI shows `isBringingUpBluetooth = true` during the async
+    /// bring-up so the Connect button can be disabled.
     func tryConnect() {
         // Validation preflight before we even touch the session layer.
         if let validation = model.settings.connectionValidationError() {
             lastErrorMessage = validation
             return
         }
+
+        if model.settings.connectionKind == .bluetooth {
+            tryConnectBluetooth()
+            return
+        }
+
         do {
             try model.connect()
         } catch {
             lastErrorMessage = error.localizedDescription
+        }
+    }
+
+    private func tryConnectBluetooth() {
+        let address = model.settings.bluetoothRadioAddress
+        guard !address.isEmpty else {
+            lastErrorMessage = "Pair a TH-D74 or TH-D75 in System Settings → Bluetooth, then pick it in Preferences → Radio."
+            return
+        }
+        guard !isBringingUpBluetooth else { return }
+        isBringingUpBluetooth = true
+        let coordinator = bluetoothCoordinator
+
+        Task { @MainActor in
+            defer { self.isBringingUpBluetooth = false }
+            do {
+                let path = try await coordinator.bringUpLink(addressString: address)
+                try self.model.connect(bluetoothPortPath: path)
+            } catch {
+                self.lastErrorMessage = error.localizedDescription
+                // If we got the RFCOMM link up but model.connect() failed,
+                // tear the link back down so we don't leak the channel.
+                coordinator.tearDownLink()
+            }
+        }
+    }
+
+    /// Disconnect MacRats and tear down the Bluetooth link if one is up.
+    /// Called by the UI Disconnect button. For non-Bluetooth connections
+    /// this is equivalent to `model.disconnect()`.
+    func disconnect() {
+        model.disconnect()
+        if model.settings.connectionKind == .bluetooth {
+            bluetoothCoordinator.tearDownLink()
         }
     }
 

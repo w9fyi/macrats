@@ -72,6 +72,16 @@ public struct MacRatsSettings: Codable, Equatable, Sendable {
     /// not used on the wire. Updated by the ConfigSheet picker.
     public var ratflectorLabel: String = ""
 
+    /// Bluetooth address ("XX:XX:XX:XX:XX:XX" format) of the paired
+    /// TH-D74/D75 to use for `.bluetooth` connections. Populated from
+    /// the ConfigSheet Bluetooth picker, which calls into
+    /// `BluetoothCoordinator.pairedRadios()`.
+    public var bluetoothRadioAddress: String = ""
+
+    /// Human-readable name of the selected Bluetooth radio, e.g.
+    /// `"TH-D75"`. Purely for UI display. The address is the identifier.
+    public var bluetoothRadioName: String = ""
+
     // MARK: - GPS panel (v1.0)
 
     /// Fixed latitude (decimal degrees). `nil` = GPS beacon disabled.
@@ -146,6 +156,7 @@ public struct MacRatsSettings: Codable, Equatable, Sendable {
     public enum ConnectionKind: String, Codable, CaseIterable, Sendable {
         case disconnected     // no transport
         case serial           // /dev/cu.* serial device
+        case bluetooth        // TH-D74/D75 over Bluetooth SPP (RFCOMM ch 2)
         case tcpLoopback      // localhost TCP peer (testing)
         case tcpRatflector    // v1.1 — remote ratflector over TCP
 
@@ -153,6 +164,7 @@ public struct MacRatsSettings: Codable, Equatable, Sendable {
             switch self {
             case .disconnected:   return "Disconnected"
             case .serial:         return "Serial / USB"
+            case .bluetooth:      return "Bluetooth (TH-D74/D75)"
             case .tcpLoopback:    return "TCP (Local test)"
             case .tcpRatflector:  return "Ratflector (Internet)"
             }
@@ -228,6 +240,10 @@ public struct MacRatsSettings: Codable, Equatable, Sendable {
             }
             if serialBaudRate <= 0 {
                 return "Baud rate must be positive."
+            }
+        case .bluetooth:
+            if bluetoothRadioAddress.isEmpty {
+                return "Pair a TH-D74 or TH-D75 in System Settings → Bluetooth, then pick it here."
             }
         case .tcpLoopback, .tcpRatflector:
             if tcpPort == 0 {

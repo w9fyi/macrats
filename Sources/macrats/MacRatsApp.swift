@@ -18,7 +18,7 @@ struct MacRatsApp: App {
                 .environmentObject(store)
                 .frame(minWidth: 780, minHeight: 520)
                 .onDisappear {
-                    store.model.disconnect()
+                    store.disconnect()
                 }
         }
         .commands {
@@ -32,7 +32,7 @@ struct MacRatsApp: App {
                 .keyboardShortcut("k", modifiers: [.command])
 
                 Button("Disconnect") {
-                    store.model.disconnect()
+                    store.disconnect()
                 }
                 .disabled(store.connectionStatus == .disconnected)
                 .keyboardShortcut("k", modifiers: [.command, .shift])

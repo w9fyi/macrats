@@ -202,6 +202,15 @@ USB-C port whenever you switch the radio into Terminal Mode (Menu 650).
 That makes the TH-D75 effectively a hotspot board with a built-in 5-watt
 transmitter and a 50-ohm antenna jack — exactly what MacRats needs.
 
+### Two ways to connect the TH-D75
+
+MacRats supports the TH-D75 over **two different physical transports** — the same radio, the same on-air bytes, different cables (or no cable):
+
+1. **USB-C cable** — plug the radio into your Mac. Appears as `/dev/cu.usbmodem...`. Requires you to be at your desk with the cable.
+2. **Bluetooth SPP** — pair the radio wirelessly through System Settings → Bluetooth. Lets you move around with the radio while MacRats stays on your Mac. Requires a one-time macOS Bluetooth permission grant the first time you connect.
+
+Both transports run the identical protocol stack underneath. Features, accessibility, and reliability are the same. Pick whichever is more convenient.
+
 ### What does NOT work with MacRats today
 
 - **Icom radios** — IC-705, ID-52, ID-51, ID-5100, IC-9700. These all
@@ -289,6 +298,89 @@ the radio itself. These settings persist on the radio across power cycles.
 When the indicator turns green, MacRats is talking to the radio. Outgoing
 messages will key the transmitter. Incoming D-STAR data frames from other
 stations will appear in the chat log and stations sidebar.
+
+---
+
+## Connecting to a Kenwood TH-D75 over Bluetooth
+
+MacRats can also talk to the TH-D75 wirelessly over Bluetooth Serial Port
+Profile (SPP). Same radio, same features, no cable. Use this when you
+want to wander around the shack with the radio while MacRats stays on
+your Mac.
+
+### One-time setup
+
+1. **Enable Bluetooth on the TH-D75.** On the radio, navigate into the
+   Bluetooth menu and turn Bluetooth on. Make sure the radio is
+   discoverable.
+2. **Do the [radio-side D-STAR + Menu 614 + Menu 980 setup](#one-time-radio-setup)**
+   from the USB section above — everything there still applies. Bluetooth
+   SPP is just a different pipe into the same radio; Menu 614 = `0.5`
+   seconds (not `Off`) is still mandatory.
+3. **Pair the radio in macOS System Settings → Bluetooth.** Click the
+   TH-D75 when it appears in the list, accept the pairing code on both
+   the radio and the Mac. The radio should now show as "Connected" in
+   System Settings.
+4. **First-run Bluetooth permission.** The first time MacRats tries to
+   open the Bluetooth link to the radio, macOS will show a permission
+   prompt: *"MacRats would like to use Bluetooth."* Click **Allow**. If
+   you accidentally deny, fix it under System Settings → Privacy &
+   Security → Bluetooth by toggling MacRats on. Without this permission,
+   MacRats will fail to bring up the link with a clear error.
+
+### Connecting over Bluetooth
+
+1. Open MacRats Preferences (`⌘,`) → **Radio** tab.
+2. Set **Connection type** to **Bluetooth (TH-D74/D75)**.
+3. The **Paired radio** picker will show every TH-D74 or TH-D75 that
+   macOS has paired. If the picker is empty, click **Refresh** after
+   making sure the radio is paired in System Settings.
+4. Pick your radio from the list.
+5. Close Preferences and press `⌘K` to connect.
+
+MacRats will show a brief "Bringing up Bluetooth link…" state while it
+opens an IOBluetooth ACL connection, opens an RFCOMM channel to the
+radio, and waits for macOS to finalize the virtual serial port. This
+typically takes 2–5 seconds. When the indicator turns green, you're
+connected.
+
+### Differences from USB
+
+- **Baud rate is automatic.** You don't choose a baud rate for
+  Bluetooth — RFCOMM is packet-based and the baud number is nominal.
+  MacRats uses a reasonable default.
+- **Power consumption.** Bluetooth keeps the radio's Bluetooth chip
+  active. Your battery will drain faster than it would over USB (where
+  the cable also carries charging current).
+- **Range.** Bluetooth SPP is rated for about 10 meters line of sight,
+  though walls and interference cut that down. If you walk too far the
+  link will drop and MacRats will report a transport error.
+- **Slightly slower first-connect.** The Bluetooth bring-up is a few
+  seconds slower than the USB bring-up because macOS has to establish
+  the ACL link and open the RFCOMM channel before the virtual serial
+  port is usable.
+
+### Troubleshooting Bluetooth
+
+- **"Pair a TH-D74 or TH-D75 in System Settings → Bluetooth"**: MacRats
+  can't see a paired radio. Pair one in System Settings first, then
+  come back to MacRats and click Refresh.
+- **"Bluetooth ACL connection failed"**: the radio is out of range,
+  powered off, or has its Bluetooth radio disabled. Check the radio.
+- **"Could not open RFCOMM channel 2"**: MacRats connected at the ACL
+  layer but couldn't open the data channel. Try toggling the radio's
+  Bluetooth off and back on at its front panel, then try again.
+- **"The Bluetooth serial port did not appear"**: the RFCOMM channel
+  opened but macOS didn't finish creating the virtual serial port
+  within 10 seconds. Power-cycling the radio almost always fixes this.
+- **"macOS denied Bluetooth permission"**: open System Settings →
+  Privacy & Security → Bluetooth and toggle MacRats on. If MacRats
+  isn't in the list, launch MacRats and try to connect once — the
+  app will be added to the list the first time it attempts a
+  Bluetooth operation.
+- **Radio refuses to transmit** (even though the Bluetooth link is
+  green): this is almost always the [Menu 614 issue](#connecting-to-a-kenwood-th-d75-over-usb).
+  Bluetooth doesn't bypass it.
 
 ---
 
@@ -386,13 +478,18 @@ Open Preferences with `⌘,`. The window has three tabs:
 
 ### Radio tab
 
-- **Connection type** — Kenwood TH-D75 (USB serial), Ratflector (Internet),
-  or TCP loopback (testing).
-- For **USB serial**:
+- **Connection type** — Serial / USB, Bluetooth (TH-D74/D75), Ratflector
+  (Internet), or TCP loopback (testing).
+- For **Serial / USB**:
   - **Serial port** — picker showing all `/dev/cu.*` devices.
   - **Baud rate** — 9600 for normal CAT, 38400 for MMDVM terminal mode.
   - **Force TX delay** — adds an extra delay before sending each frame to
     accommodate radios with slow PTT relays. Most users can leave at 0.
+- For **Bluetooth**:
+  - **Paired radio** — picker listing all TH-D74/D75 radios paired through
+    System Settings → Bluetooth. Click **Refresh** after pairing a new one.
+  - Transport tuning (warmup, force TX delay, wire log) is shared with the
+    Serial / USB path — the knobs behave identically.
 - For **Ratflector**:
   - **Public ratflector** — picker that loads from the upstream
     `ham-radio-software/ratflectors` directory.
@@ -523,9 +620,11 @@ for v1.1 or v1.2.
 - **No file transfer** — chat, ping, and status only. Planned for v1.2.
 - **No structured forms** (ICS-213, etc.) — planned for v1.2.
 - **No map view** — planned for v1.2 using MapKit.
-- **No Bluetooth SPP** — USB serial only for v1.0. Bluetooth is planned
-  for v1.1 and will require an `IOBluetooth` coordinator to bring up the
-  RFCOMM channel before the existing serial transport can use the radio.
+- **Bluetooth SPP implemented but awaiting live testing** — The Bluetooth
+  transport was added to v0.1 dev builds but has not yet been verified
+  end-to-end against a real paired TH-D75. The code path, permissions,
+  and RFCOMM channel 2 handling are all in place; if you try it and hit
+  problems, please file an issue.
 - **No Winlink / email gateway** — planned for v1.2+.
 - **TH-D75 only** — other radios will work in principle if they expose
   D-STAR slow data over a serial-like interface, but only the TH-D75 is

@@ -160,6 +160,7 @@ struct SetupWizard: View {
 
             Picker("Connection type", selection: $draft.connectionKind) {
                 Text("Serial / USB (to a real radio)").tag(MacRatsSettings.ConnectionKind.serial)
+                Text("Bluetooth (Kenwood TH-D74 / TH-D75)").tag(MacRatsSettings.ConnectionKind.bluetooth)
                 Text("Ratflector (Internet, no radio needed)").tag(MacRatsSettings.ConnectionKind.tcpRatflector)
                 Text("Local TCP (for testing with another instance)").tag(MacRatsSettings.ConnectionKind.tcpLoopback)
                 Text("Disconnected (configure later)").tag(MacRatsSettings.ConnectionKind.disconnected)
@@ -169,7 +170,11 @@ struct SetupWizard: View {
 
             switch draft.connectionKind {
             case .serial:
-                Text("Best for: Kenwood TH-D75, Icom ID-51, and other radios with a USB or serial data port.")
+                Text("Best for: Kenwood TH-D75 plugged in with a USB cable. Also works with MMDVM hotspot boards.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            case .bluetooth:
+                Text("Best for: the Kenwood TH-D74 or TH-D75 paired wirelessly. Pair the radio first in System Settings → Bluetooth, then pick it in Preferences → Radio after you finish the wizard.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             case .tcpRatflector:
@@ -265,6 +270,11 @@ struct SetupWizard: View {
             } else if draft.connectionKind == .tcpLoopback {
                 SummaryRow(label: "Host", value: draft.tcpHost.isEmpty ? "(listen)" : draft.tcpHost)
                 SummaryRow(label: "Port", value: "\(draft.tcpPort)")
+            } else if draft.connectionKind == .bluetooth {
+                Text("After finishing this wizard, open Preferences (⌘,) → Radio and pick your paired TH-D74 or TH-D75 from the Bluetooth radio picker. Pair the radio first in System Settings → Bluetooth if you haven't already.")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .padding(.top, 4)
             }
 
             Text("Click Finish to save these settings. You can open Preferences (⌘,) any time to change them.")
@@ -314,7 +324,10 @@ struct SetupWizard: View {
                 step = .serialDetails
             case .tcpLoopback, .tcpRatflector:
                 step = .tcpDetails
-            case .disconnected:
+            case .bluetooth, .disconnected:
+                // Bluetooth pairing is done in System Settings → Bluetooth;
+                // the radio picker in Preferences → Radio finishes the
+                // setup after the wizard dismisses.
                 step = .finish
             }
         case .serialDetails, .tcpDetails:
@@ -336,9 +349,9 @@ struct SetupWizard: View {
             step = .connection
         case .finish:
             switch draft.connectionKind {
-            case .serial:                   step = .serialDetails
+            case .serial:                      step = .serialDetails
             case .tcpLoopback, .tcpRatflector: step = .tcpDetails
-            case .disconnected:             step = .connection
+            case .bluetooth, .disconnected:    step = .connection
             }
         }
     }

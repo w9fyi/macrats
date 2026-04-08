@@ -22,6 +22,8 @@ struct ConfigSheet: View {
     @State private var working: MacRatsSettings = MacRatsSettings()
     @State private var availablePorts: [SerialPortDiscovery.Port] = []
     @State private var didInitialize = false
+    @State private var pairedBluetoothRadios: [BluetoothPairedRadioRow] = []
+    @State private var bluetoothStatus: String = ""
 
     var body: some View {
         TabView {
@@ -99,6 +101,11 @@ struct ConfigSheet: View {
                    !isLoadingRatflectors {
                     loadRatflectorDirectory()
                 }
+                // Auto-scan paired Bluetooth radios when the user
+                // switches to Bluetooth mode.
+                if working.connectionKind == .bluetooth && pairedBluetoothRadios.isEmpty {
+                    refreshBluetoothRadios()
+                }
             }
 
             Group {
@@ -109,6 +116,9 @@ struct ConfigSheet: View {
 
                 case .serial:
                     serialSection
+
+                case .bluetooth:
+                    bluetoothSection
 
                 case .tcpLoopback:
                     tcpLoopbackSection
@@ -198,6 +208,130 @@ struct ConfigSheet: View {
             return "\(Int(value)) s"
         }
         return String(format: "%.1f s", value)
+    }
+
+    // MARK: - Bluetooth section
+
+    /// Lightweight row model for the Bluetooth picker. We don't want to
+    /// leak `BluetoothCoordinator.PairedRadio` into SwiftUI state because
+    /// it pulls in IOBluetooth; this struct is trivially Sendable.
+    struct BluetoothPairedRadioRow: Identifiable, Equatable {
+        let id: String   // the MAC address — unique per radio
+        let name: String
+        let address: String
+        let isLinked: Bool
+    }
+
+    @ViewBuilder
+    private var bluetoothSection: some View {
+        Section {
+            HStack {
+                Picker("Paired radio", selection: $working.bluetoothRadioAddress) {
+                    Text("— Select a radio —").tag("")
+                    ForEach(pairedBluetoothRadios) { row in
+                        Text(bluetoothRowLabel(row)).tag(row.address)
+                    }
+                }
+                .onChange(of: working.bluetoothRadioAddress) { _, newAddress in
+                    if let row = pairedBluetoothRadios.first(where: { $0.address == newAddress }) {
+                        working.bluetoothRadioName = row.name
+                    } else if newAddress.isEmpty {
+                        working.bluetoothRadioName = ""
+                    }
+                    commit()
+                }
+                .accessibilityLabel("Paired Bluetooth radio")
+
+                Button {
+                    refreshBluetoothRadios()
+                } label: {
+                    Label("Refresh", systemImage: "arrow.clockwise")
+                }
+                .help("Re-scan paired Bluetooth devices")
+                .accessibilityLabel("Refresh list of paired Bluetooth radios")
+            }
+
+            if !bluetoothStatus.isEmpty {
+                Text(bluetoothStatus)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel("Bluetooth status: \(bluetoothStatus)")
+            }
+
+            Text("Pair your TH-D74 or TH-D75 in System Settings → Bluetooth before picking it here. The first time MacRats opens the radio's Bluetooth link, macOS may ask you to allow Bluetooth access — say yes.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        } header: {
+            Text("Bluetooth radio")
+        }
+
+        // The Bluetooth path reuses the same warmup / force-delay / wire
+        // log controls as the serial path, because the bytes ultimately
+        // flow through USBSerialTransport once BluetoothCoordinator has
+        // brought up the RFCOMM link.
+        transportTuningSection
+    }
+
+    /// Pull paired TH-D74/D75 radios from `BluetoothCoordinator` and
+    /// populate `pairedBluetoothRadios`. Main-actor-safe.
+    private func refreshBluetoothRadios() {
+        let coordinator = store.bluetoothCoordinator
+        let radios = coordinator.pairedRadios()
+        pairedBluetoothRadios = radios.map { radio in
+            BluetoothPairedRadioRow(
+                id: radio.address,
+                name: radio.name,
+                address: radio.address,
+                isLinked: radio.existingPortPath != nil || radio.isCurrentlyConnected
+            )
+        }
+        if pairedBluetoothRadios.isEmpty {
+            bluetoothStatus = "No paired TH-D74 or TH-D75 found. Pair one in System Settings → Bluetooth, then click Refresh."
+        } else {
+            bluetoothStatus = "Found \(pairedBluetoothRadios.count) paired radio\(pairedBluetoothRadios.count == 1 ? "" : "s")."
+        }
+    }
+
+    private func bluetoothRowLabel(_ row: BluetoothPairedRadioRow) -> String {
+        if row.isLinked {
+            return "\(row.name) (\(row.address)) — linked"
+        }
+        return "\(row.name) (\(row.address))"
+    }
+
+    /// Shared transport-tuning section used by both the serial and
+    /// Bluetooth paths (they both end up driving a USBSerialTransport).
+    @ViewBuilder
+    private var transportTuningSection: some View {
+        Section {
+            Stepper("Warmup length: \(working.warmupLength) bytes",
+                    value: $working.warmupLength,
+                    in: 0...64)
+                .onChange(of: working.warmupLength) { _, _ in commit() }
+                .accessibilityHint("Number of filler bytes prefixed to the first frame after an idle period, to wake up the receiving radio.")
+
+            Stepper("Warmup idle timeout: \(Self.formatSeconds(working.warmupTimeoutSeconds))",
+                    value: $working.warmupTimeoutSeconds,
+                    in: 0...30,
+                    step: 1)
+                .onChange(of: working.warmupTimeoutSeconds) { _, _ in commit() }
+
+            Stepper("Force TX delay: \(Self.formatSeconds(working.forceDelaySeconds))",
+                    value: $working.forceDelaySeconds,
+                    in: 0...10,
+                    step: 0.5)
+                .onChange(of: working.forceDelaySeconds) { _, _ in commit() }
+
+            Toggle("Log wire traffic to ~/Downloads/MacRats/wire.log",
+                   isOn: $working.wireLoggingEnabled)
+                .onChange(of: working.wireLoggingEnabled) { _, _ in commit() }
+        } header: {
+            Text("Transport tuning")
+        } footer: {
+            Text("These settings control the low-level wire behavior toward the radio. Defaults match D-Rats's recommended values for radio connections.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
     }
 
     @ViewBuilder

@@ -88,7 +88,8 @@ So **"MMDVM-compliant"** in MacRats's vocabulary specifically means *"speaks the
 
 | Hardware | Status | Notes |
 |---|---|---|
-| **Kenwood TH-D75** | ✅ Tested, working | The reference radio. Phase 1 over-the-air pass on 2026-04-07. Requires the [Menu 614 fix](#configuring-the-th-d75-for-macrats). |
+| **Kenwood TH-D75 over USB-C** | ✅ Tested, working | The reference radio. Phase 1 over-the-air pass on 2026-04-07. Requires the [Menu 614 fix](#configuring-the-th-d75-for-macrats). |
+| **Kenwood TH-D75 over Bluetooth SPP** | 🟢 Implemented (v0.1 dev), live test pending | Same radio, wireless. Requires pairing in System Settings → Bluetooth first. MacRats brings up an `IOBluetooth` ACL + RFCOMM channel 2 link and hands the resulting `/dev/cu.*` path to the existing serial transport. First connect may show a macOS Bluetooth permission prompt. |
 
 ### Should work in theory but untested
 
@@ -113,12 +114,45 @@ If anyone has one of these boards and wants to try it, please file an issue with
 
 In rough priority order (subject to change based on what hardware shows up):
 
-1. **Bluetooth SPP for the TH-D75** (v1.1) — same radio, no cable
+1. ~~**Bluetooth SPP for the TH-D75**~~ — **implemented in dev, awaiting live test.** See the [Bluetooth section below](#bluetooth-spp-for-the-th-d75).
 2. **Icom IC-705 / ID-52 transport** (v1.1 or v1.2) — second radio family, biggest user-facing impact
 3. **KISS TNC transport** (v1.2) — opens the door to packet radios in general, including the TH-D74
 4. **Hotspot board verification** (low effort, will be done as a side effect of helping anyone who tries)
 
 If you want to help move any of these forward — especially the Icom transport, since it requires actual hardware to test — please open an issue and say so.
+
+## Bluetooth SPP for the TH-D75
+
+MacRats can talk to the TH-D75 wirelessly over Bluetooth Serial Port Profile (SPP). The radio must be paired through **System Settings → Bluetooth** first — MacRats does not do its own device inquiry. After pairing, pick the radio in Preferences → Radio, set connection type to "Bluetooth (TH-D74/D75)", and press Connect.
+
+### How it works
+
+macOS creates and persists a `/dev/cu.TH-D75` (or similar) device file for any paired Bluetooth SPP device, but the file is a **stale shim** until two things happen:
+
+1. An `IOBluetooth` **ACL connection** is open to the radio, and
+2. An `IOBluetoothRFCOMMChannel` is open to **RFCOMM channel 2** (NOT the SDP-advertised SPP channel 1), and the channel reference is held alive in memory for the lifetime of the link.
+
+Releasing the RFCOMM channel tears down the cu.* file on the next GC tick. MacRats's `BluetoothCoordinator` (in `MacRatsCore`) handles the `IOBluetooth` dance, holds the channel reference on `MacRatsStore` (which lives for the app's lifetime), polls up to 10 seconds for the cu.* file to appear, and then hands the resolved path to `USBSerialTransport` — the exact same transport used for USB, unchanged.
+
+**RFCOMM channel 2** is the critical detail. The TH-D75's SDP record advertises SPP on a different channel, but the radio only actually carries data on channel 2. This is hard-won knowledge from the sibling `th-programmer` project, confirmed via the `d75link` binary. `BluetoothCoordinator.bringUpLink` hard-codes channel 2.
+
+### First-run TCC prompt
+
+The first time MacRats opens an RFCOMM channel, macOS shows a Bluetooth permission prompt: *"MacRats would like to use Bluetooth."* Click **Allow**. If you accidentally deny, fix it in System Settings → Privacy & Security → Bluetooth. Without this permission, `openRFCOMMChannelSync` returns `kIOReturnNotPermitted` and the bring-up fails — MacRats will retry once after 1.5 seconds (to cover the case where the prompt is still on screen) and then surface a clear error.
+
+The `NSBluetoothAlwaysUsageDescription` key in `scripts/macrats-Info.plist` is what triggers the prompt. Without it, TCC denies silently.
+
+### Troubleshooting
+
+- **"Pair a TH-D74 or TH-D75 in System Settings → Bluetooth"**: MacRats doesn't see a paired radio. Pair in System Settings, then click Refresh in Preferences → Radio → Bluetooth.
+- **"ACL connection failed"**: the radio is out of range, powered off, or its Bluetooth radio is disabled. Turn Bluetooth on at the radio's front panel and try again.
+- **"Could not open RFCOMM channel 2"**: usually means the radio is linked via System Settings but the baseband connection has gone stale after a power cycle. MacRats will close and reopen the ACL link automatically, but you can force this by toggling Bluetooth off and back on at the radio.
+- **"The Bluetooth serial port did not appear"**: the RFCOMM channel opened but macOS didn't create the cu.* file within 10 seconds. Turn the radio off and back on.
+- **"macOS denied Bluetooth permission"**: open System Settings → Privacy & Security → Bluetooth and toggle MacRats on.
+
+### Same Menu 614 rule applies
+
+Bluetooth SPP just carries the same DDT2 bytes that the USB path carries — it's a different pipe into the same radio. **Menu 614 (Data TX End Timing) still has to be set to `0.5` seconds, not `Off`**, or the radio will silently swallow bytes no matter how perfect the Bluetooth link is. See [The Menu 614 gotcha](#the-menu-614-gotcha) below.
 
 ## Configuring the TH-D75 for MacRats
 

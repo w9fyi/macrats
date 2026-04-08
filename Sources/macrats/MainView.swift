@@ -169,7 +169,7 @@ struct MainView: View {
 
     private func toggleConnection() {
         if store.connectionStatus == .connected {
-            store.model.disconnect()
+            store.disconnect()
         } else {
             store.tryConnect()
         }

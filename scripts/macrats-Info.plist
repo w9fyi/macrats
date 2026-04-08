@@ -66,5 +66,12 @@
          hooks. Optional but good practice for an accessibility-first app. -->
     <key>NSAccessibilityEnabled</key>
     <true/>
+
+    <!-- Bluetooth usage description. Required by TCC on macOS 11+ before
+         an application can open an IOBluetoothRFCOMMChannel. Without this,
+         the first bring-up attempt returns kIOReturnNotPermitted and macOS
+         shows no prompt — the denial is silent. -->
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>MacRats uses Bluetooth to connect to your Kenwood TH-D74 or TH-D75 radio over Serial Port Profile (SPP) for sending and receiving D-Rats messages.</string>
 </dict>
 </plist>
