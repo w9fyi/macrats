@@ -30,7 +30,15 @@ let package = Package(
     ],
     targets: [
         .target(
-            name: "MacRatsCore"
+            name: "MacRatsCore",
+            linkerSettings: [
+                // libz is required by FileTransferSession for raw zlib
+                // compress/decompress that matches Python's
+                // zlib.compress byte-for-byte. macOS ships libz with
+                // the SDK at /usr/lib/libz.dylib; this just adds -lz
+                // to the link line.
+                .linkedLibrary("z")
+            ]
         ),
         .executableTarget(
             name: "macrats-sniff",

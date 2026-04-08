@@ -221,9 +221,16 @@ open class StatefulSession: Session, @unchecked Sendable {
     /// uses this to drive the idle-timeout close.
     private var lastActivity: Date = Date()
 
-    /// Set to true when the session has been explicitly closed (either
-    /// by the app or via retry exhaustion). The worker exits its loop.
+    /// Set to true when the worker should exit on its next iteration.
+    /// Flipped by `forceClose()`, by retry exhaustion, by the idle
+    /// timeout, or by `close()` once the drain is complete.
     private var closed = false
+
+    /// Set to true when `close()` was called. The worker keeps
+    /// running until all queued and outstanding blocks have drained,
+    /// then flips `closed = true` and exits. `forceClose()` sets both
+    /// flags immediately.
+    private var closeRequested = false
 
     // MARK: - Worker coordination
 
@@ -277,6 +284,14 @@ open class StatefulSession: Session, @unchecked Sendable {
         guard !data.isEmpty else { return }
 
         lock.lock()
+        // Silently drop sends on a closed (or closing) session. We
+        // don't throw — the app layer often queues follow-up bytes
+        // after calling close() in its own drain path, and we want
+        // those to be a no-op rather than a surprise exception.
+        if closeRequested || closed {
+            lock.unlock()
+            return
+        }
         var remaining = data
         while !remaining.isEmpty {
             let chunkSize = Swift.min(remaining.count, blocksize)
@@ -292,13 +307,33 @@ open class StatefulSession: Session, @unchecked Sendable {
         workerEvent.signal()
     }
 
-    /// Close the session. After calling this, no further sends will be
-    /// accepted; inbound data already in the OOO queue is drained to
-    /// the delegate and the worker exits. The `delegate.didClose`
-    /// callback fires once the worker has cleaned up.
+    /// Gracefully close the session. After calling this, no further
+    /// sends will be accepted, but any bytes already in the outbound
+    /// queue or in flight will still be transmitted and acknowledged
+    /// before the worker exits. Inbound data already in the OOO queue
+    /// is drained to the delegate.
+    ///
+    /// The `delegate.didClose` callback fires once the worker has
+    /// cleaned up — which may take many seconds for a large in-flight
+    /// window on a slow link. Callers that need immediate teardown
+    /// (e.g. transport disconnect) should use `forceClose()` instead.
     public func close() {
         lock.lock()
+        closeRequested = true
+        lock.unlock()
+
+        workerEvent.signal()
+    }
+
+    /// Immediately close the session without waiting for outbound
+    /// drain. Any queued or outstanding blocks are dropped. Used for
+    /// emergency teardown — transport disconnect, app shutdown, etc.
+    public func forceClose() {
+        lock.lock()
+        closeRequested = true
         closed = true
+        outq.removeAll()
+        outstanding.removeAll()
         lock.unlock()
 
         workerEvent.signal()
@@ -454,6 +489,16 @@ open class StatefulSession: Session, @unchecked Sendable {
                 return
             }
 
+            // Graceful close: if close() was requested and there's
+            // nothing left to send or wait for, flip to full closed
+            // on this iteration.
+            if closeRequested && outq.isEmpty && outstanding.isEmpty {
+                closed = true
+                lock.unlock()
+                deliverClose(reason: nil)
+                return
+            }
+
             // Retry exhaustion check. Put this BEFORE we try to make
             // progress so a dead peer can't starve the close.
             if retryAttempts >= Self.maxRetries {
@@ -480,7 +525,10 @@ open class StatefulSession: Session, @unchecked Sendable {
             let blocksToSend = outstanding.filter { !$0.transmitted }
             let needReqAck = !outstanding.isEmpty && shouldSendReqAckLocked()
             let idleElapsed = Date().timeIntervalSince(lastActivity)
-            let isIdle = outstanding.isEmpty && outq.isEmpty
+            // When close has been requested, we shouldn't enter the
+            // idle long-sleep — we want to exit the loop as soon as
+            // draining completes.
+            let isIdle = outstanding.isEmpty && outq.isEmpty && !closeRequested
             lock.unlock()
 
             // Transmit any blocks that need it.
