@@ -464,6 +464,31 @@ public final class MacRatsAppModel: @unchecked Sendable {
         try chatSession.advertise(status: status, message: message)
     }
 
+    /// Broadcast a GPS position beacon using the fixed coordinates
+    /// from settings. Returns `.notAttachedToManager` if we're not
+    /// currently connected. Returns a "no fixed position" error if
+    /// the user hasn't configured `fixedLatitude` / `fixedLongitude`.
+    public func broadcastGPSBeacon() throws {
+        guard let chatSession else {
+            throw SessionError.notAttachedToManager
+        }
+        let s = snapshot().settings
+        guard let lat = s.fixedLatitude, let lon = s.fixedLongitude else {
+            throw SessionError.notAttachedToManager
+        }
+        try chatSession.sendGPSBeacon(latitude: lat,
+                                      longitude: lon,
+                                      comment: s.gpsComment)
+
+        // Echo locally so the user sees their own beacon in the log,
+        // same way sendChatMessage echoes outgoing chat.
+        append(ChatMessage(kind: .gpsFix(latitude: lat, longitude: lon),
+                           sStation: s.callsign,
+                           dStation: "CQCQCQ",
+                           text: s.gpsComment.isEmpty ? "Position fix" : s.gpsComment,
+                           outgoing: true))
+    }
+
     // MARK: - Internal state transitions
 
     fileprivate func handleIncomingMessage(_ text: String, from sStation: String, to dStation: String) {
@@ -499,6 +524,24 @@ public final class MacRatsAppModel: @unchecked Sendable {
                            sStation: sStation,
                            dStation: "CQCQCQ",
                            text: message,
+                           outgoing: false))
+    }
+
+    fileprivate func handleIncomingGPSFix(_ fix: GPSBeacon.Fix) {
+        stationTracker.noteGPSFix(from: fix.station,
+                                  latitude: fix.latitude,
+                                  longitude: fix.longitude,
+                                  comment: fix.comment)
+        // Display as a chat-log entry so the user sees the beacon
+        // arrive. Comment is kept as the text so "KB4XYZ at QTH" shows
+        // up in the chat view; if no comment, use a placeholder.
+        let displayText = fix.comment.isEmpty
+            ? "Position fix"
+            : fix.comment
+        append(ChatMessage(kind: .gpsFix(latitude: fix.latitude, longitude: fix.longitude),
+                           sStation: fix.station,
+                           dStation: "CQCQCQ",
+                           text: displayText,
                            outgoing: false))
     }
 
@@ -599,5 +642,9 @@ private final class ChatDelegateShim: ChatSession.Delegate, @unchecked Sendable 
 
     func chatSession(_ session: ChatSession, didReceiveStationStatus from: String, status: StationStatus, message: String) {
         owner?.handleIncomingStatus(from: from, status: status, message: message)
+    }
+
+    func chatSession(_ session: ChatSession, didReceiveGPSFix fix: GPSBeacon.Fix) {
+        owner?.handleIncomingGPSFix(fix)
     }
 }

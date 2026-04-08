@@ -50,6 +50,7 @@ struct ChatSessionTests {
         var pingRequests: [Ping] = []
         var pingResponses: [PingResponse] = []
         var statusUpdates: [StatusUpdate] = []
+        var gpsFixes: [GPSBeacon.Fix] = []
 
         private var messageContinuations: [CheckedContinuation<Message, Never>] = []
 
@@ -83,6 +84,12 @@ struct ChatSessionTests {
         func chatSession(_ session: ChatSession, didReceiveStationStatus from: String, status: StationStatus, message: String) {
             lock.lock()
             statusUpdates.append(StatusUpdate(from: from, status: status, message: message))
+            lock.unlock()
+        }
+
+        func chatSession(_ session: ChatSession, didReceiveGPSFix fix: GPSBeacon.Fix) {
+            lock.lock()
+            gpsFixes.append(fix)
             lock.unlock()
         }
 

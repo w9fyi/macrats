@@ -24,6 +24,12 @@ public struct ChatMessage: Identifiable, Equatable, Sendable {
         /// An internal event — connection state changes, errors, etc.
         /// Not a real on-air frame.
         case systemEvent
+
+        /// A GPS position fix from a station's `$$CRC` beacon. The
+        /// latitude and longitude are decimal degrees; the chat view
+        /// renders this as a one-line "📍 W9FYI at 30.267,-97.743"
+        /// entry rather than showing the raw APRS payload.
+        case gpsFix(latitude: Double, longitude: Double)
     }
 
     public let id: UUID
@@ -72,7 +78,7 @@ public struct ChatMessage: Identifiable, Equatable, Sendable {
         switch kind {
         case .status:
             return true
-        case .message, .pingRequest, .pingResponse, .systemEvent:
+        case .message, .pingRequest, .pingResponse, .systemEvent, .gpsFix:
             return false
         }
     }

@@ -44,6 +44,7 @@ public final class ChatSession: StatelessSession, @unchecked Sendable {
         func chatSession(_ session: ChatSession, didReceiveEchoRequest from: String, to dStation: String, payload: Data)
         func chatSession(_ session: ChatSession, didReceiveEchoResponse from: String, to dStation: String, payload: Data)
         func chatSession(_ session: ChatSession, didReceiveStationStatus from: String, status: StationStatus, message: String)
+        func chatSession(_ session: ChatSession, didReceiveGPSFix fix: GPSBeacon.Fix)
     }
 
     /// Default delegate implementations so apps only need to override the
@@ -114,6 +115,33 @@ public final class ChatSession: StatelessSession, @unchecked Sendable {
         try advertise(status: currentStatus, message: currentStatusMessage)
     }
 
+    /// Broadcast a fixed-position GPS beacon as a `$$CRC` APRS payload
+    /// inside a `T_DEF` chat frame. The beacon is keyed off the station
+    /// manager's own callsign — the caller just supplies the coordinates
+    /// and an optional comment. Receivers that understand the D-Rats
+    /// beacon format (MacRats, upstream D-Rats) route this to their
+    /// GPS delegate hook instead of rendering it as a chat message.
+    ///
+    /// - Parameters:
+    ///   - latitude: Decimal degrees (negative = South).
+    ///   - longitude: Decimal degrees (negative = West).
+    ///   - comment: Free-form comment, clipped to 43 characters by the
+    ///     encoder.
+    ///   - dest: Destination, defaults to `CQCQCQ` (broadcast). D-Rats
+    ///     beacons are almost always broadcasts; addressed beacons are
+    ///     unusual but allowed.
+    public func sendGPSBeacon(latitude: Double,
+                              longitude: Double,
+                              comment: String = "",
+                              to dest: String = "CQCQCQ") throws {
+        let station = manager?.callsign ?? "UNKNOWN"
+        let payload = GPSBeacon.encode(station: station,
+                                       latitude: latitude,
+                                       longitude: longitude,
+                                       comment: comment)
+        try write(payload, dest: dest)
+    }
+
     // MARK: - Inbound
 
     /// Override StatelessSession.incomingData to interpret the 6 chat
@@ -141,12 +169,22 @@ public final class ChatSession: StatelessSession, @unchecked Sendable {
 
     private func handleDefault(_ frame: DDT2Frame) {
         // Upstream attempts to parse the payload as a GPS fix first via
-        // `gps.parse_gps(frame_data)`. If it's a valid fix, it emits
-        // `incoming-gps-fix`. Otherwise it's a chat message. We defer GPS
-        // parsing to a later session (it's its own large port from
-        // `d_rats/gps.py`); for now everything in T_DEF goes through as a
-        // plain message.
+        // `gps.parse_gps(frame_data)`. If it's a valid `$$CRC<hex>,...`
+        // beacon, the fix goes to the GPS delegate hook; otherwise the
+        // payload falls through as a chat message. The checksum is
+        // verified inside GPSBeacon.decode, so a corrupted beacon or a
+        // chat message that happens to contain `$$CRC` won't be mistaken
+        // for a real fix.
         let text = String(decoding: frame.data, as: UTF8.self)
+        if let fix = GPSBeacon.decode(text) {
+            // Upstream emits the fix event and also logs the underlying
+            // message in the chat log. MacRats only routes the fix —
+            // rendering a raw `$$CRC,...` blob in the chat view is
+            // noise. Apps that want both behaviors can subscribe to
+            // both delegate methods.
+            delegate?.chatSession(self, didReceiveGPSFix: fix)
+            return
+        }
         delegate?.chatSession(self,
                               didReceiveMessage: text,
                               from: frame.sStation,
@@ -256,4 +294,5 @@ private final class NoopChatDelegate: ChatSession.Delegate, @unchecked Sendable 
     func chatSession(_ session: ChatSession, didReceiveEchoRequest from: String, to dStation: String, payload: Data) {}
     func chatSession(_ session: ChatSession, didReceiveEchoResponse from: String, to dStation: String, payload: Data) {}
     func chatSession(_ session: ChatSession, didReceiveStationStatus from: String, status: StationStatus, message: String) {}
+    func chatSession(_ session: ChatSession, didReceiveGPSFix fix: GPSBeacon.Fix) {}
 }

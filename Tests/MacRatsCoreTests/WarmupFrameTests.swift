@@ -285,6 +285,9 @@ struct WarmupFrameTests {
             func chatSession(_ session: ChatSession, didReceiveStationStatus from: String, status: StationStatus, message: String) {
                 lock.lock(); calls.append("status"); lock.unlock()
             }
+            func chatSession(_ session: ChatSession, didReceiveGPSFix fix: GPSBeacon.Fix) {
+                lock.lock(); calls.append("gpsFix"); lock.unlock()
+            }
             func snapshot() -> [String] { lock.lock(); defer { lock.unlock() }; return calls }
         }
         let recorder = Recorder()

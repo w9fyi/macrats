@@ -219,4 +219,14 @@ final class MacRatsStore: ObservableObject {
             lastErrorMessage = error.localizedDescription
         }
     }
+
+    /// Send the configured fixed-position GPS beacon now. Surfaces any
+    /// error (no connection, no coordinates set) into `lastErrorMessage`.
+    func broadcastGPSBeacon() {
+        do {
+            try model.broadcastGPSBeacon()
+        } catch {
+            lastErrorMessage = "Could not broadcast GPS beacon. Make sure you're connected and have set a fixed latitude and longitude in Preferences → GPS."
+        }
+    }
 }

@@ -56,6 +56,14 @@ struct StationsView: View {
         if station.messageCount > 0 {
             parts.append("\(station.messageCount) message\(station.messageCount == 1 ? "" : "s")")
         }
+        if let lat = station.lastLatitude, let lon = station.lastLongitude {
+            let latStr = String(format: "%.4f", lat)
+            let lonStr = String(format: "%.4f", lon)
+            parts.append("position \(latStr), \(lonStr)")
+            if !station.lastGPSComment.isEmpty {
+                parts.append(station.lastGPSComment)
+            }
+        }
         return parts.joined(separator: ", ")
     }
 
@@ -104,6 +112,14 @@ struct StationRow: View {
                             .lineLimit(1)
                     }
                 }
+            }
+            if let lat = station.lastLatitude, let lon = station.lastLongitude {
+                let latStr = String(format: "%.4f", lat)
+                let lonStr = String(format: "%.4f", lon)
+                Text("\(latStr), \(lonStr)\(station.lastGPSComment.isEmpty ? "" : " — \(station.lastGPSComment)")")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
         }
         .padding(.vertical, 2)

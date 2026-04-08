@@ -12,6 +12,14 @@ public struct HeardStation: Identifiable, Equatable, Sendable {
     public var messageCount: Int
     public var pingCount: Int
 
+    /// Last known latitude in decimal degrees, from a `$$CRC` GPS beacon.
+    /// Nil until the station sends a position fix.
+    public var lastLatitude: Double?
+    /// Last known longitude in decimal degrees.
+    public var lastLongitude: Double?
+    /// Last comment broadcast alongside a GPS fix.
+    public var lastGPSComment: String
+
     public var id: String { callsign }
 
     public init(callsign: String,
@@ -19,13 +27,19 @@ public struct HeardStation: Identifiable, Equatable, Sendable {
                 lastStatus: StationStatus = .unknown,
                 lastStatusMessage: String = "",
                 messageCount: Int = 0,
-                pingCount: Int = 0) {
+                pingCount: Int = 0,
+                lastLatitude: Double? = nil,
+                lastLongitude: Double? = nil,
+                lastGPSComment: String = "") {
         self.callsign = callsign
         self.lastHeard = lastHeard
         self.lastStatus = lastStatus
         self.lastStatusMessage = lastStatusMessage
         self.messageCount = messageCount
         self.pingCount = pingCount
+        self.lastLatitude = lastLatitude
+        self.lastLongitude = lastLongitude
+        self.lastGPSComment = lastGPSComment
     }
 }
 
@@ -93,6 +107,23 @@ public final class HeardStationTracker: @unchecked Sendable {
         station.lastHeard = Date()
         station.lastStatus = status
         station.lastStatusMessage = message
+        stations[callsign] = station
+    }
+
+    /// Note a GPS position fix from `callsign`. Updates the cached
+    /// latitude / longitude / comment and bumps lastHeard.
+    public func noteGPSFix(from callsign: String,
+                           latitude: Double,
+                           longitude: Double,
+                           comment: String) {
+        guard !callsign.isEmpty, callsign != "CQCQCQ" else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        var station = stations[callsign] ?? HeardStation(callsign: callsign)
+        station.lastHeard = Date()
+        station.lastLatitude = latitude
+        station.lastLongitude = longitude
+        station.lastGPSComment = comment
         stations[callsign] = station
     }
 

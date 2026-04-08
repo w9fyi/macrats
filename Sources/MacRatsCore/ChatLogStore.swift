@@ -231,6 +231,7 @@ public final class ChatLogStore: @unchecked Sendable {
             case pingResponse
             case status
             case systemEvent
+            case gpsFix
         }
 
         let id: String
@@ -242,6 +243,8 @@ public final class ChatLogStore: @unchecked Sendable {
         let out: Bool
         let statusCode: Int?   // present only when kind == status
         let replyText: String? // present only when kind == pingResponse
+        let latitude: Double?  // present only when kind == gpsFix
+        let longitude: Double? // present only when kind == gpsFix
 
         init(from message: ChatMessage) {
             self.id = message.id.uuidString
@@ -256,22 +259,38 @@ public final class ChatLogStore: @unchecked Sendable {
                 self.kind = .message
                 self.statusCode = nil
                 self.replyText = nil
+                self.latitude = nil
+                self.longitude = nil
             case .pingRequest:
                 self.kind = .pingRequest
                 self.statusCode = nil
                 self.replyText = nil
+                self.latitude = nil
+                self.longitude = nil
             case .pingResponse(let reply):
                 self.kind = .pingResponse
                 self.statusCode = nil
                 self.replyText = reply
+                self.latitude = nil
+                self.longitude = nil
             case .status(let status):
                 self.kind = .status
                 self.statusCode = status.rawValue
                 self.replyText = nil
+                self.latitude = nil
+                self.longitude = nil
             case .systemEvent:
                 self.kind = .systemEvent
                 self.statusCode = nil
                 self.replyText = nil
+                self.latitude = nil
+                self.longitude = nil
+            case .gpsFix(let lat, let lon):
+                self.kind = .gpsFix
+                self.statusCode = nil
+                self.replyText = nil
+                self.latitude = lat
+                self.longitude = lon
             }
         }
 
@@ -291,6 +310,8 @@ public final class ChatLogStore: @unchecked Sendable {
                 chatKind = .status(resolved)
             case .systemEvent:
                 chatKind = .systemEvent
+            case .gpsFix:
+                chatKind = .gpsFix(latitude: latitude ?? 0, longitude: longitude ?? 0)
             }
             return ChatMessage(id: uuid,
                                timestamp: timestamp,

@@ -301,4 +301,9 @@ final class ChatPrinter: ChatSession.Delegate, @unchecked Sendable {
     func chatSession(_ session: ChatSession, didReceiveStationStatus from: String, status: StationStatus, message: String) {
         print("\n[\(timestamp())] STATUS \(from): \(status.description) — \(message)")
     }
+
+    func chatSession(_ session: ChatSession, didReceiveGPSFix fix: GPSBeacon.Fix) {
+        let commentBit = fix.comment.isEmpty ? "" : " — \(fix.comment)"
+        print("\n[\(timestamp())] GPS FIX \(fix.station) at \(fix.latitude),\(fix.longitude)\(commentBit)")
+    }
 }

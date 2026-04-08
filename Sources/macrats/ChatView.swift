@@ -223,6 +223,11 @@ struct ChatRow: View {
             return "\(message.sStation) status: \(s.description)"
         case .systemEvent:
             return "MacRats"
+        case .gpsFix(let lat, let lon):
+            let latStr = String(format: "%.4f", lat)
+            let lonStr = String(format: "%.4f", lon)
+            let who = message.outgoing ? "Your position" : "\(message.sStation) position"
+            return "\(who) \(latStr), \(lonStr)"
         }
     }
 
@@ -242,6 +247,7 @@ struct ChatRow: View {
         case .pingResponse: return .blue
         case .status:      return .purple
         case .systemEvent: return .secondary
+        case .gpsFix:      return .green
         }
     }
 
@@ -284,6 +290,17 @@ struct ChatRow: View {
             }
         case .systemEvent:
             parts.append("MacRats: \(message.text)")
+        case .gpsFix(let lat, let lon):
+            let latStr = String(format: "%.4f", lat)
+            let lonStr = String(format: "%.4f", lon)
+            if message.outgoing {
+                parts.append("You broadcast your position: \(latStr), \(lonStr)")
+            } else {
+                parts.append("\(message.sStation) position fix: \(latStr), \(lonStr)")
+            }
+            if !message.text.isEmpty && message.text != "Position fix" {
+                parts.append("Comment: \(message.text)")
+            }
         }
         if isNotice {
             parts.append("(mentions you)")

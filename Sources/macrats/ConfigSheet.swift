@@ -466,21 +466,37 @@ struct ConfigSheet: View {
     private var gpsTab: some View {
         Form {
             Section {
-                Text("Fixed position beacon — broadcast your location with chat.")
+                Text("Fixed position beacon — broadcast your location to other D-Rats stations.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
                 TextField("Latitude (e.g. 30.2672)", value: $working.fixedLatitude,
                           format: .number.precision(.fractionLength(0...6)))
                     .onChange(of: working.fixedLatitude) { _, _ in commit() }
+                    .accessibilityHint("Decimal degrees. Negative values are south of the equator.")
 
                 TextField("Longitude (e.g. -97.7431)", value: $working.fixedLongitude,
                           format: .number.precision(.fractionLength(0...6)))
                     .onChange(of: working.fixedLongitude) { _, _ in commit() }
+                    .accessibilityHint("Decimal degrees. Negative values are west of the prime meridian.")
 
-                TextField("GPS comment", text: $working.gpsComment)
+                TextField("Comment", text: $working.gpsComment)
                     .onChange(of: working.gpsComment) { _, _ in commit() }
-                    .accessibilityHint("Free-form text broadcast with your position fix.")
+                    .accessibilityHint("Free-form text broadcast with your position fix. Clipped to 43 characters on the wire.")
+            }
+
+            Section {
+                Button("Send beacon now") {
+                    store.broadcastGPSBeacon()
+                }
+                .disabled(working.fixedLatitude == nil
+                          || working.fixedLongitude == nil
+                          || store.connectionStatus != .connected)
+                .accessibilityHint("Transmit your configured fixed position as a D-Rats APRS beacon. Requires an active connection and a fixed latitude and longitude.")
+            } footer: {
+                Text("Broadcasts as a D-Rats $$CRC position report inside a regular chat frame. Other MacRats and upstream D-Rats stations will see your location in their station list.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
