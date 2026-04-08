@@ -237,19 +237,34 @@ public final class MacRatsAppModel: @unchecked Sendable {
             transport = USBSerialTransport(devicePath: settings.serialDevicePath,
                                            baudRate: settings.serialBaudRate)
         case .bluetooth:
-            // Requires the caller to have already brought up the RFCOMM
-            // channel via BluetoothCoordinator and passed us the resolved
-            // /dev/cu.* path. Without that, the cu.* file either does not
-            // exist or is a stale shim that eats bytes.
-            guard let btPath = bluetoothPortPath, !btPath.isEmpty else {
-                log("connect refused: .bluetooth kind but no bluetoothPortPath supplied")
+            // The Bluetooth path uses BluetoothRFCOMMTransport, which
+            // talks to RFCOMM channel 2 directly via IOBluetooth. The
+            // /dev/cu.* file is intentionally NOT used — bytes never
+            // traverse the kernel BT serial driver because on macOS the
+            // cu.* file is a stale shim for the TH-D75 (the SDP-
+            // advertised SPP service is wired to a different endpoint
+            // than the data TNC). The transport handles its own
+            // bring-up; the caller does not need to pre-resolve a path.
+            // The legacy `bluetoothPortPath` parameter is kept for
+            // source compatibility but ignored.
+            _ = bluetoothPortPath
+            #if canImport(IOBluetooth)
+            let btAddress = settings.bluetoothRadioAddress
+            guard !btAddress.isEmpty else {
+                log("connect refused: .bluetooth kind but no bluetoothRadioAddress in settings")
                 throw SessionError.notAttachedToManager
             }
-            // TH-D75 Bluetooth SPP runs at a fixed 9600 baud on macOS —
-            // the RFCOMM layer is packet-based so baud rate is nominal,
-            // but passing the same value the USB path uses in "normal"
-            // (non-terminal) mode keeps the code path identical.
-            transport = USBSerialTransport(devicePath: btPath, baudRate: 9600)
+            let btTransport = BluetoothRFCOMMTransport(address: btAddress)
+            // Forward bring-up trace to the app log so MacRatsStore can
+            // mirror it into ~/Downloads/MacRats/bluetooth.log.
+            btTransport.onDiagnosticLine = { [weak self] line in
+                self?.log("[BT] " + line)
+            }
+            transport = btTransport
+            #else
+            log("connect refused: .bluetooth kind but IOBluetooth unavailable on this platform")
+            throw SessionError.notAttachedToManager
+            #endif
         case .tcpLoopback:
             if settings.tcpHost.isEmpty {
                 transport = TCPLoopbackTransport(mode: .server(port: settings.tcpPort))

@@ -136,6 +136,19 @@ public final class BluetoothCoordinator {
     /// lifetime of the serial transport or macOS tears down the cu.* file.
     private var rfcommChannel: IOBluetoothRFCOMMChannel?
 
+    /// The kept-alive RFCOMM channel delegate. IOBluetooth holds the delegate
+    /// only weakly via the channel's internal pointer, so we have to retain it
+    /// ourselves for the lifetime of the channel. Cleared on teardown.
+    private var rfcommDelegate: RFCOMMChannelDelegate?
+
+    /// Total bytes received via the IOBluetooth RFCOMM delegate since the
+    /// last `bringUpLink` call. Updated from the delegate's data callback,
+    /// which is the most direct evidence we have that bytes are actually
+    /// crossing the air link (the `/dev/cu.*` file is unreliable on Tahoe —
+    /// it can succeed reads against an empty kernel buffer even when no
+    /// bytes have flowed). Read by the diagnostic UI.
+    public private(set) var rfcommRxBytes: Int = 0
+
     /// The device we're currently linked to. Cleared on teardown.
     private var currentDevice: IOBluetoothDevice?
 
@@ -227,6 +240,7 @@ public final class BluetoothCoordinator {
     public func bringUpLink(addressString: String) async throws -> String {
         tearDownLink()
         lastDiagnosticTrace.removeAll()
+        rfcommRxBytes = 0
 
         trace("bringUpLink start: address=\(addressString)")
         trace("macOS: \(ProcessInfo.processInfo.operatingSystemVersionString)")
@@ -267,54 +281,6 @@ public final class BluetoothCoordinator {
             trace("skipping ACL open — device already connected")
         }
 
-        // Step 1.5: if macOS already created the /dev/cu.* device file,
-        // trust it and return early.
-        //
-        // On macOS Sonoma and earlier, the documented behavior (via the
-        // sibling th-programmer project) was that the cu.* file is a
-        // stale shim — bytes written to it go nowhere unless the app
-        // holds an IOBluetoothRFCOMMChannel reference alive. That made
-        // the bring-up require an explicit openRFCOMMChannelSync.
-        //
-        // On macOS Tahoe (26.x), that sync API appears to be broken:
-        // it blocks for ~3 seconds waiting for a delegate callback
-        // that never arrives and returns kIOReturnError even though
-        // a channel object is allocated. Trying every channel in
-        // {SDP-advertised, 2, 1, 3} produces the same result.
-        //
-        // Meanwhile, macOS itself has already paired the radio through
-        // System Settings, established an RFCOMM link from its own
-        // Bluetooth daemon, and created a live `/dev/cu.TH-D75` file
-        // managed entirely by the system. We should use that file,
-        // not fight the deprecated legacy API.
-        //
-        // Strategy:
-        //   1. Open the ACL connection (to make sure the baseband is up
-        //      and recover from stale cached state).
-        //   2. If the cu.* file exists, return it — trust that macOS
-        //      is managing the RFCOMM channel internally.
-        //   3. Only fall back to the explicit openRFCOMMChannelSync
-        //      dance if the cu.* file is missing, which would indicate
-        //      a platform where we still need to drive the RFCOMM open
-        //      ourselves.
-        //
-        // If bytes don't actually flow after this (i.e., the cu.* file
-        // is in fact a stale shim on Tahoe too), we'll need to move to
-        // the async `openRFCOMMChannelAsync` API with a real delegate
-        // — the modern replacement for the broken sync variant.
-        if let managedPath = Self.findPortPath(forDeviceName: device.name ?? "",
-                                               addressString: addressString) {
-            trace("pre-existing cu.* file found: \(managedPath)")
-            trace("skipping RFCOMM dance — trusting macOS-managed link")
-            self.currentDevice = device
-            // No RFCOMM channel reference to hold — macOS is managing
-            // the link on our behalf. tearDownLink() is still valid
-            // because it's a no-op when rfcommChannel is nil.
-            return managedPath
-        }
-
-        trace("no pre-existing cu.* file — falling back to explicit RFCOMM open")
-
         // Step 2: figure out which RFCOMM channel(s) to try and open one.
         //
         // The TH-D75 historically uses channel 2 for its data path (this
@@ -329,16 +295,193 @@ public final class BluetoothCoordinator {
         //   3. Prepend channel 2 if it's not already in the list (so we
         //      still catch the d75link path)
         //   4. Try each candidate in order and stop on the first success
-        //
-        // Each attempt that fails is remembered so if the whole list is
-        // exhausted we can surface the most useful error to the user.
         let candidates = await discoverRFCOMMCandidates(for: device)
 
-        var lastError: Int32 = kIOReturnError
-        var lastReason = "no channels tried"
+        // Step 3: try the modern async open with a real delegate first.
+        //
+        // On macOS Tahoe (26.x), `openRFCOMMChannelSync` is broken — it
+        // blocks for ~3 seconds waiting for a delegate callback that
+        // never fires and returns generic `kIOReturnError` even though
+        // a channel object is allocated. The fix Apple ships is the
+        // async variant, `openRFCOMMChannelAsync(_:withChannelID:delegate:)`,
+        // which returns immediately with a status code and then fires
+        // `rfcommChannelOpenComplete:status:` on the delegate when the
+        // open is actually complete. This is the supported path on
+        // current macOS and we should prefer it everywhere.
+        //
+        // The delegate also gives us a reliable `rfcommChannelData:data:length:`
+        // hook so we can count RX bytes for diagnostics. The hard
+        // question on Tahoe is whether bytes actually flow at all
+        // through any of the IOBluetooth APIs — the RX byte counter
+        // is how we'll find out.
+        if let asyncPath = try await tryAsyncRFCOMMOpen(device: device,
+                                                        candidates: candidates,
+                                                        addressString: addressString) {
+            return asyncPath
+        }
 
+        // Step 4: legacy sync open. Kept as a fallback for older macOS
+        // (Sonoma and earlier) where the sync API still works and the
+        // async variant might have its own quirks. Will fail-fast on
+        // Tahoe with the same generic error we've been seeing.
+        trace("async path exhausted — falling back to legacy sync open")
+        if let syncPath = try await tryLegacyRFCOMMOpen(device: device,
+                                                        candidates: candidates,
+                                                        addressString: addressString) {
+            return syncPath
+        }
+
+        // Step 5: last-ditch — if macOS itself has already paired the
+        // radio and created a `/dev/cu.*` file (managed by the system
+        // Bluetooth daemon, NOT by us holding an RFCOMM channel), use
+        // that. This is the path we used in commit 3dcf65a as the
+        // Tahoe workaround. We now know it's a "stale shim" — bytes
+        // written go nowhere because nothing is keeping the kernel
+        // RFCOMM session alive — but it's still our best fallback if
+        // both the async and sync APIs have rejected us.
+        if let managedPath = Self.findPortPath(forDeviceName: device.name ?? "",
+                                               addressString: addressString) {
+            trace("WARNING: all RFCOMM open attempts failed; trusting pre-existing cu.* file")
+            trace("  this path is unreliable — bytes may not actually flow over the air link")
+            trace("  resolved path: \(managedPath)")
+            self.currentDevice = device
+            return managedPath
+        }
+
+        // Nothing worked.
+        let tried = candidates.map { "\($0.channelID)" }.joined(separator: ", ")
+        throw CoordinatorError.rfcommChannelFailed(
+            code: kIOReturnError,
+            channelID: candidates.last?.channelID ?? 2,
+            reason: "tried channel(s) \(tried) via async + sync APIs; no cu.* file present"
+        )
+    }
+
+    // MARK: - Async RFCOMM open (modern path, primary)
+
+    /// Attempt to open an RFCOMM channel using the modern async API with
+    /// a real delegate. Returns the resolved cu.* path on success, nil on
+    /// failure (caller falls back to the legacy sync path). Throws only
+    /// on TCC permission denial.
+    private func tryAsyncRFCOMMOpen(device: IOBluetoothDevice,
+                                    candidates: [RFCOMMCandidate],
+                                    addressString: String) async throws -> String? {
         for candidate in candidates {
-            trace("attempt RFCOMM open: channel=\(candidate.channelID) source=\(candidate.source)")
+            trace("attempt async RFCOMM open: channel=\(candidate.channelID) source=\(candidate.source)")
+
+            let delegate = RFCOMMChannelDelegate()
+            // Trace RX bytes the moment they arrive. This is the most
+            // direct evidence that the link is actually carrying data.
+            // The callback fires on whatever thread IOBluetooth is using
+            // for delegate dispatch (historically the main run loop) so
+            // we hop back to MainActor before touching any state.
+            delegate.onData = { [weak self] count in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.rfcommRxBytes += count
+                    self.trace("RFCOMM RX +\(count) bytes (total \(self.rfcommRxBytes))")
+                }
+            }
+            delegate.onClosed = { [weak self] in
+                Task { @MainActor [weak self] in
+                    self?.trace("RFCOMM channel closed by remote or system")
+                }
+            }
+
+            var channel: IOBluetoothRFCOMMChannel?
+            let kickoff = device.openRFCOMMChannelAsync(
+                &channel,
+                withChannelID: BluetoothRFCOMMChannelID(candidate.channelID),
+                delegate: delegate
+            )
+            trace("  async kickoff → \(Self.describeIOReturn(kickoff)) channel=\(channel == nil ? "nil" : "non-nil")")
+
+            if kickoff == IOReturn(kIOReturnNotPermitted) {
+                trace("  kIOReturnNotPermitted on async kickoff — waiting 1.5s for TCC prompt then retrying")
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+                channel = nil
+                let retry = device.openRFCOMMChannelAsync(
+                    &channel,
+                    withChannelID: BluetoothRFCOMMChannelID(candidate.channelID),
+                    delegate: delegate
+                )
+                trace("  async retry kickoff → \(Self.describeIOReturn(retry))")
+                if retry == IOReturn(kIOReturnNotPermitted) {
+                    throw CoordinatorError.permissionDenied
+                }
+                if retry != kIOReturnSuccess {
+                    try? await Task.sleep(nanoseconds: 200_000_000)
+                    continue
+                }
+            } else if kickoff != kIOReturnSuccess {
+                try? await Task.sleep(nanoseconds: 200_000_000)
+                continue
+            }
+
+            // Wait for `rfcommChannelOpenComplete:status:`. Cap at 5s —
+            // the typical successful open completes in under a second.
+            let openStatus = await delegate.awaitOpenComplete(timeout: 5.0)
+            switch openStatus {
+            case .success:
+                trace("  async open complete: status=success")
+            case .failed(let code):
+                trace("  async open complete: status=\(Self.describeIOReturn(code))")
+                // Channel allocation may still be sitting in `channel` —
+                // close it explicitly so the next candidate has a clean
+                // slate.
+                if let ch = channel { _ = ch.close() }
+                try? await Task.sleep(nanoseconds: 200_000_000)
+                continue
+            case .timeout:
+                trace("  async open TIMED OUT after 5s — no rfcommChannelOpenComplete callback")
+                if let ch = channel { _ = ch.close() }
+                try? await Task.sleep(nanoseconds: 200_000_000)
+                continue
+            }
+
+            // Open succeeded. Hold the channel + delegate alive for the
+            // lifetime of the transport.
+            guard let channel else {
+                trace("  WARNING: open status was success but channel pointer is nil — skipping")
+                continue
+            }
+            self.rfcommChannel = channel
+            self.rfcommDelegate = delegate
+            self.currentDevice = device
+            trace("  RFCOMM channel \(candidate.channelID) OPEN (async) — keeping reference alive")
+
+            // Poll up to 10 s for the /dev/cu.* device file to appear.
+            for _ in 0..<20 {
+                if let path = Self.findPortPath(forDeviceName: device.name ?? "",
+                                                addressString: addressString) {
+                    trace("  cu.* file resolved: \(path)")
+                    return path
+                }
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            }
+
+            // Channel is up but no cu.* file appeared. This is a
+            // diagnostic-worthy state: the modern API succeeded yet
+            // the kernel serial driver didn't materialize a port. Tear
+            // down so the next candidate (or the legacy fallback) gets
+            // a clean slate.
+            trace("  async open succeeded but no cu.* file appeared in 10s — tearing down and trying next path")
+            tearDownLink()
+        }
+        return nil
+    }
+
+    // MARK: - Legacy RFCOMM open (sync, fallback)
+
+    /// Attempt to open an RFCOMM channel using the deprecated synchronous
+    /// API. Kept as a fallback for older macOS versions where the async
+    /// path may not behave as expected. Returns the resolved cu.* path
+    /// on success, nil on failure.
+    private func tryLegacyRFCOMMOpen(device: IOBluetoothDevice,
+                                     candidates: [RFCOMMCandidate],
+                                     addressString: String) async throws -> String? {
+        for candidate in candidates {
+            trace("attempt sync RFCOMM open: channel=\(candidate.channelID) source=\(candidate.source)")
             var channel: IOBluetoothRFCOMMChannel?
             var openResult = device.openRFCOMMChannelSync(
                 &channel,
@@ -347,8 +490,6 @@ public final class BluetoothCoordinator {
             )
             trace("  sync open → \(Self.describeIOReturn(openResult)) channel=\(channel == nil ? "nil" : "non-nil")")
 
-            // TCC prompt handling: wait for the user to click Allow on
-            // the macOS Bluetooth permission dialog, then retry once.
             if openResult == IOReturn(kIOReturnNotPermitted) {
                 trace("  kIOReturnNotPermitted — waiting 1.5s for TCC prompt")
                 try? await Task.sleep(nanoseconds: 1_500_000_000)
@@ -365,42 +506,25 @@ public final class BluetoothCoordinator {
             }
 
             if openResult == kIOReturnSuccess, let channel {
-                trace("  RFCOMM channel \(candidate.channelID) OPEN — keeping reference alive")
+                trace("  RFCOMM channel \(candidate.channelID) OPEN (sync) — keeping reference alive")
                 self.rfcommChannel = channel
                 self.currentDevice = device
-                lastError = kIOReturnSuccess
-                break
+
+                for _ in 0..<20 {
+                    if let path = Self.findPortPath(forDeviceName: device.name ?? "",
+                                                    addressString: addressString) {
+                        return path
+                    }
+                    try? await Task.sleep(nanoseconds: 500_000_000)
+                }
+                trace("  sync open succeeded but no cu.* file appeared in 10s — tearing down and trying next path")
+                tearDownLink()
+                continue
             }
 
-            lastError = openResult
-            lastReason = candidate.source
-            // Small pause between attempts — the radio sometimes rate-limits
-            // rejected RFCOMM opens.
             try? await Task.sleep(nanoseconds: 200_000_000)
         }
-
-        if lastError != kIOReturnSuccess || self.rfcommChannel == nil {
-            let tried = candidates.map { "\($0.channelID)" }.joined(separator: ", ")
-            throw CoordinatorError.rfcommChannelFailed(
-                code: lastError,
-                channelID: candidates.last?.channelID ?? 2,
-                reason: "tried channel(s) \(tried); last source: \(lastReason)"
-            )
-        }
-
-        // Step 3: poll up to 10 s for the /dev/cu.* device file to appear.
-        for _ in 0..<20 {
-            if let path = Self.findPortPath(forDeviceName: device.name ?? "",
-                                            addressString: addressString) {
-                return path
-            }
-            try? await Task.sleep(nanoseconds: 500_000_000)
-        }
-
-        // The channel is up but no cu.* file appeared. Release the channel
-        // before throwing so we don't leak it.
-        tearDownLink()
-        throw CoordinatorError.portDidNotAppear
+        return nil
     }
 
     /// A single RFCOMM channel we're going to try, plus a short label for
@@ -432,10 +556,19 @@ public final class BluetoothCoordinator {
             candidates.append(RFCOMMCandidate(channelID: id, source: source))
         }
 
-        // Collect every RFCOMM channel ID from every SDP service record.
-        // We don't filter by service UUID — we just want any channel the
-        // radio has offered. The TH-D75's data channel has been reported
-        // to not always be tagged with the standard SPP UUID.
+        // **TH-D75-specific priority:** the data TNC channel is RFCOMM
+        // channel 2 according to the d75link binary in the sibling
+        // th-programmer project. The radio also advertises another SPP
+        // service on channel 1 that appears to be a different endpoint
+        // (memory programming, OBEX file transfer, or similar) — not
+        // the data TNC. If we open channel 1 first, the open will
+        // succeed but no bytes will ever flow because we're talking
+        // to the wrong service. Always try channel 2 FIRST.
+        addCandidate(2, source: "TH-D75 d75link data channel")
+
+        // Then enumerate every RFCOMM channel ID from the SDP service
+        // records. We don't filter by service UUID — we just want any
+        // channel the radio has offered.
         if let services = device.services as? [IOBluetoothSDPServiceRecord] {
             trace("device.services: \(services.count) service record(s)")
             for (idx, service) in services.enumerated() {
@@ -453,9 +586,7 @@ public final class BluetoothCoordinator {
             trace("device.services: nil or unexpected type")
         }
 
-        // Always try the historical TH-D75 data channel (from d75link).
-        addCandidate(2, source: "TH-D75 hard-coded fallback")
-        // And a couple of common SPP channel numbers as last resorts.
+        // Generic SPP channel numbers as last resorts.
         addCandidate(1, source: "generic SPP channel 1 fallback")
         addCandidate(3, source: "generic SPP channel 3 fallback")
 
@@ -494,6 +625,7 @@ public final class BluetoothCoordinator {
             ch.setDelegate(nil)
         }
         rfcommChannel = nil
+        rfcommDelegate = nil
         // Intentionally don't call currentDevice.closeConnection() — macOS
         // keeps the ACL connection cached across re-opens and closing it
         // here just makes the next bring-up slower. The ACL link will time
@@ -630,5 +762,113 @@ public final class BluetoothCoordinator {
         }
         return output
     }
+}
+
+// MARK: - RFCOMM Channel Delegate (modern async path)
+
+/// Bridge between the C-style `IOBluetoothRFCOMMChannelDelegate` informal
+/// protocol and Swift `async`. Lives outside `BluetoothCoordinator` because
+/// IOBluetooth dispatches delegate callbacks from internal threads, and
+/// nesting it inside a `@MainActor` class would force every callback to
+/// hop through the main actor before it could even update its own state.
+///
+/// The delegate exposes:
+///
+/// - `awaitOpenComplete(timeout:)` — async wait for `rfcommChannelOpenComplete`
+///   with a hard timeout. Resolves to `.success`, `.failed(IOReturn)`, or
+///   `.timeout`.
+/// - `onData` — fired for every `rfcommChannelData` callback with the byte
+///   count. The coordinator uses this to drive its `rfcommRxBytes` counter
+///   for diagnostics.
+/// - `onClosed` — fired when the channel closes (either side).
+///
+/// All state mutation is serialized through an internal NSLock so the
+/// callbacks can fire from any thread without races.
+final class RFCOMMChannelDelegate: NSObject, @unchecked Sendable {
+
+    enum OpenStatus {
+        case success
+        case failed(IOReturn)
+        case timeout
+    }
+
+    /// Fired for every RX data callback with the number of bytes received.
+    /// Set by the coordinator before kicking off the async open.
+    var onData: ((Int) -> Void)?
+
+    /// Fired when the RFCOMM channel closes. Set by the coordinator before
+    /// kicking off the async open.
+    var onClosed: (() -> Void)?
+
+    private let lock = NSLock()
+    private var openContinuation: CheckedContinuation<OpenStatus, Never>?
+    private var openResolved = false
+
+    /// Suspend until `rfcommChannelOpenComplete:status:` fires, or `timeout`
+    /// seconds elapse, whichever comes first. Safe to call exactly once per
+    /// delegate instance — the open continuation can only resolve once.
+    func awaitOpenComplete(timeout: TimeInterval) async -> OpenStatus {
+        await withCheckedContinuation { (cont: CheckedContinuation<OpenStatus, Never>) in
+            lock.lock()
+            if openResolved {
+                lock.unlock()
+                cont.resume(returning: .failed(kIOReturnAborted))
+                return
+            }
+            openContinuation = cont
+            lock.unlock()
+
+            // Schedule a hard timeout that races against the delegate
+            // callback. Whichever fires first wins; resolveOpen() is
+            // idempotent.
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) { [weak self] in
+                self?.resolveOpen(.timeout)
+            }
+        }
+    }
+
+    private func resolveOpen(_ status: OpenStatus) {
+        lock.lock()
+        if openResolved {
+            lock.unlock()
+            return
+        }
+        openResolved = true
+        let cont = openContinuation
+        openContinuation = nil
+        lock.unlock()
+        cont?.resume(returning: status)
+    }
+
+    // MARK: - IOBluetoothRFCOMMChannelDelegate (informal)
+
+    @objc func rfcommChannelOpenComplete(_ rfcommChannel: IOBluetoothRFCOMMChannel!,
+                                          status error: IOReturn) {
+        if error == kIOReturnSuccess {
+            resolveOpen(.success)
+        } else {
+            resolveOpen(.failed(error))
+        }
+    }
+
+    @objc func rfcommChannelData(_ rfcommChannel: IOBluetoothRFCOMMChannel!,
+                                  data dataPointer: UnsafeMutableRawPointer!,
+                                  length dataLength: Int) {
+        onData?(dataLength)
+    }
+
+    @objc func rfcommChannelClosed(_ rfcommChannel: IOBluetoothRFCOMMChannel!) {
+        // If we close before the open callback fires (e.g. immediate
+        // failure), make sure any pending awaiter still gets a result.
+        resolveOpen(.failed(kIOReturnAborted))
+        onClosed?()
+    }
+
+    @objc func rfcommChannelControlSignalsChanged(_ rfcommChannel: IOBluetoothRFCOMMChannel!) {}
+    @objc func rfcommChannelFlowControlChanged(_ rfcommChannel: IOBluetoothRFCOMMChannel!) {}
+    @objc func rfcommChannelWriteComplete(_ rfcommChannel: IOBluetoothRFCOMMChannel!,
+                                           refcon: UnsafeMutableRawPointer!,
+                                           status error: IOReturn) {}
+    @objc func rfcommChannelQueueSpaceAvailable(_ rfcommChannel: IOBluetoothRFCOMMChannel!) {}
 }
 #endif

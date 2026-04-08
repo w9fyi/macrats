@@ -127,44 +127,28 @@ final class MacRatsStore: ObservableObject {
         }
         guard !isBringingUpBluetooth else { return }
         isBringingUpBluetooth = true
-        let coordinator = bluetoothCoordinator
 
-        // Stream every trace line from the coordinator into the debug
-        // log as it happens, so the user can tail the bring-up live
-        // instead of waiting for a success or failure to see anything.
-        coordinator.onDiagnosticLine = { [weak self] line in
-            guard let self else { return }
-            Task { @MainActor in
-                self.debugLog.append("[BT] " + line)
-                if self.debugLog.count > 500 {
-                    self.debugLog.removeFirst(self.debugLog.count - 500)
-                }
-            }
-        }
-
-        Task { @MainActor in
-            defer {
-                self.isBringingUpBluetooth = false
-                coordinator.onDiagnosticLine = nil
-            }
-            do {
-                let path = try await coordinator.bringUpLink(addressString: address)
-                // Write the success trace too — useful to confirm which
-                // RFCOMM channel actually worked on the user's hardware.
-                Self.writeBluetoothLog(
-                    header: "SUCCESS — resolved path: \(path)",
-                    trace: coordinator.lastDiagnosticTrace
-                )
-                try self.model.connect(bluetoothPortPath: path)
-            } catch {
-                let logPath = Self.writeBluetoothLog(
-                    header: "FAILED — \(error.localizedDescription)",
-                    trace: coordinator.lastDiagnosticTrace
-                )
-                let logHint = logPath.map { "\n\nFull bring-up trace written to \($0) — please include that file if reporting this as a bug." } ?? ""
-                self.lastErrorMessage = error.localizedDescription + logHint
-                coordinator.tearDownLink()
-            }
+        // The Bluetooth path now uses BluetoothRFCOMMTransport (built
+        // inside model.connect()), which talks to RFCOMM channel 2
+        // directly via IOBluetooth and writes its own trace to
+        // ~/Downloads/MacRats/bluetooth.log. We no longer call
+        // BluetoothCoordinator.bringUpLink — that path went through the
+        // /dev/cu.* virtual serial port, which on macOS turns out to be
+        // a stale shim for the TH-D75: bytes flow out but never come
+        // back. The cu.* file and a held-alive RFCOMM channel cannot
+        // coexist on the same SDP service, so the only way to actually
+        // exchange bytes is to bypass cu.* entirely.
+        //
+        // The bring-up runs asynchronously inside the transport itself,
+        // so connect() returns immediately and the transport posts
+        // status changes through its delegate. We unconditionally clear
+        // isBringingUpBluetooth here — the connection state is then
+        // observed via the model's normal status pipeline.
+        defer { self.isBringingUpBluetooth = false }
+        do {
+            try model.connect()
+        } catch {
+            lastErrorMessage = error.localizedDescription
         }
     }
 
@@ -210,9 +194,10 @@ final class MacRatsStore: ObservableObject {
     /// this is equivalent to `model.disconnect()`.
     func disconnect() {
         model.disconnect()
-        if model.settings.connectionKind == .bluetooth {
-            bluetoothCoordinator.tearDownLink()
-        }
+        // BluetoothRFCOMMTransport tears down its own RFCOMM channel
+        // when model.disconnect() releases it; no extra coordinator
+        // teardown is needed. (BluetoothCoordinator is still kept around
+        // for paired-radio enumeration in the picker UI.)
     }
 
     func sendChatMessage(_ text: String, to dest: String) {

@@ -72,7 +72,7 @@ MacRats is option 2. It exists because GTK on macOS is a structural dead end for
 
 Primary test radio: **Kenwood TH-D75** (built-in TNC, USB-C serial, D-STAR DV slow-data). Enumerates on macOS as `/dev/cu.usbmodem*` (CDC-ACM, no driver needed on macOS — the built-in CDC-ACM driver handles it).
 
-**v1.0 transport: USB only.** Bluetooth SPP is planned for v1.1 but is **not** a free addition — although macOS exposes paired Bluetooth SPP devices as `/dev/cu.*` device files, the device file is a stale shim until an `IOBluetooth` ACL connection is open AND an `IOBluetoothRFCOMMChannel` reference is held alive in memory. Specifically for the TH-D75, the data channel is **RFCOMM channel 2** (not the SDP-advertised SPP channel — this is hard-won knowledge from the sibling `th-programmer` project's `BluetoothManager.swift`). v1.1 will add a thin `BluetoothCoordinator` modeled on that proven pattern, then hand the resulting cu.* path to the existing `USBSerialTransport`.
+**v1.0 transports: USB and Bluetooth SPP** for the TH-D75, plus TCP loopback and ratflector (Internet) for development and radioless use. The Bluetooth path is **not** a thin wrapper over the USB path — although macOS exposes paired Bluetooth SPP devices as `/dev/cu.*` device files, reading and writing through those device files does not carry data on the TH-D75's DV data TNC. The Bluetooth transport speaks to `IOBluetoothRFCOMMChannel` directly via `writeAsync` + the `rfcommChannelData` delegate callback and hard-codes **RFCOMM channel 2** (the data channel confirmed via the sibling `th-programmer` project's `RFCOMMTransport` and the `d75link` binary). See the [Bluetooth SPP section below](#bluetooth-spp-for-the-th-d75) for the full explanation.
 
 ## Radio compatibility
 
@@ -89,7 +89,7 @@ So **"MMDVM-compliant"** in MacRats's vocabulary specifically means *"speaks the
 | Hardware | Status | Notes |
 |---|---|---|
 | **Kenwood TH-D75 over USB-C** | ✅ Tested, working | The reference radio. Phase 1 over-the-air pass on 2026-04-07. Requires the [Menu 614 fix](#configuring-the-th-d75-for-macrats). |
-| **Kenwood TH-D75 over Bluetooth SPP** | 🟢 Implemented (v0.1 dev), live test pending | Same radio, wireless. Requires pairing in System Settings → Bluetooth first. MacRats brings up an `IOBluetooth` ACL + RFCOMM channel 2 link and hands the resulting `/dev/cu.*` path to the existing serial transport. First connect may show a macOS Bluetooth permission prompt. |
+| **Kenwood TH-D75 over Bluetooth SPP** | 🟢 Implemented via a dedicated `BluetoothRFCOMMTransport` | Same radio, wireless. Requires pairing in System Settings → Bluetooth first, plus Menu 984 set to `Bluetooth` on the radio. MacRats brings up an `IOBluetooth` ACL + RFCOMM channel 2 link and talks to the channel object directly — no `/dev/cu.*` device file is involved. First connect may show a macOS Bluetooth permission prompt. |
 
 ### Should work in theory but untested
 
@@ -127,14 +127,19 @@ MacRats can talk to the TH-D75 wirelessly over Bluetooth Serial Port Profile (SP
 
 ### How it works
 
-macOS creates and persists a `/dev/cu.TH-D75` (or similar) device file for any paired Bluetooth SPP device, but the file is a **stale shim** until two things happen:
+The TH-D75 advertises a Bluetooth SPP service, and macOS will create a `/dev/cu.TH-D75` device file for the paired radio, but that `cu.*` file is **not** how MacRats exchanges bytes with the radio. Reading and writing through `cu.*` sends TX bytes into the void and never delivers RX bytes at all — the kernel BT serial driver is wired to a different endpoint than the TH-D75's DV data TNC.
 
-1. An `IOBluetooth` **ACL connection** is open to the radio, and
-2. An `IOBluetoothRFCOMMChannel` is open to **RFCOMM channel 2** (NOT the SDP-advertised SPP channel 1), and the channel reference is held alive in memory for the lifetime of the link.
+Instead, MacRats uses a dedicated `BluetoothRFCOMMTransport` (in `MacRatsCore`) that:
 
-Releasing the RFCOMM channel tears down the cu.* file on the next GC tick. MacRats's `BluetoothCoordinator` (in `MacRatsCore`) handles the `IOBluetooth` dance, holds the channel reference on `MacRatsStore` (which lives for the app's lifetime), polls up to 10 seconds for the cu.* file to appear, and then hands the resolved path to `USBSerialTransport` — the exact same transport used for USB, unchanged.
+1. Opens an `IOBluetooth` **ACL connection** to the paired radio.
+2. Opens **RFCOMM channel 2** directly via `openRFCOMMChannelAsync` with a real delegate. Channel 2 is the TH-D75's data channel — knowledge borrowed from the sibling `th-programmer` project's `RFCOMMTransport`, confirmed via the `d75link` binary and the SDP service enumeration the radio advertises.
+3. Sends TX bytes via `channel.writeAsync(pointer, length:)` directly to the channel object.
+4. Receives RX bytes from the `rfcommChannelData(_:data:length:)` delegate callback and forwards them up to the DDT2 session layer.
+5. Holds the channel reference alive for the lifetime of the connection.
 
-**RFCOMM channel 2** is the critical detail. The TH-D75's SDP record advertises SPP on a different channel, but the radio only actually carries data on channel 2. This is hard-won knowledge from the sibling `th-programmer` project, confirmed via the `d75link` binary. `BluetoothCoordinator.bringUpLink` hard-codes channel 2.
+No `/dev/cu.*` file is involved on the Bluetooth path. This is a hard divergence from the USB path, which does use a POSIX serial device file — Bluetooth and USB look identical up at the `RadioTransport` protocol layer, but the transports are two separate implementations.
+
+Why the async API: on macOS Tahoe (26.x), the legacy `openRFCOMMChannelSync` blocks for ~3 seconds and returns generic `kIOReturnError` for every channel ID, even when a channel object is allocated. The modern `openRFCOMMChannelAsync` + `rfcommChannelOpenComplete:status:` delegate callback works correctly on Tahoe and is the supported path on current macOS.
 
 ### First-run TCC prompt
 
@@ -147,12 +152,15 @@ The `NSBluetoothAlwaysUsageDescription` key in `scripts/macrats-Info.plist` is w
 - **"Pair a TH-D74 or TH-D75 in System Settings → Bluetooth"**: MacRats doesn't see a paired radio. Pair in System Settings, then click Refresh in Preferences → Radio → Bluetooth.
 - **"ACL connection failed"**: the radio is out of range, powered off, or its Bluetooth radio is disabled. Turn Bluetooth on at the radio's front panel and try again.
 - **"Could not open RFCOMM channel 2"**: usually means the radio is linked via System Settings but the baseband connection has gone stale after a power cycle. MacRats will close and reopen the ACL link automatically, but you can force this by toggling Bluetooth off and back on at the radio.
-- **"The Bluetooth serial port did not appear"**: the RFCOMM channel opened but macOS didn't create the cu.* file within 10 seconds. Turn the radio off and back on.
+- **"The Bluetooth serial port did not appear"**: the RFCOMM channel opened but macOS didn't create the `cu.*` file within 10 seconds. Turn the radio off and back on.
 - **"macOS denied Bluetooth permission"**: open System Settings → Privacy & Security → Bluetooth and toggle MacRats on.
 
-### Same Menu 614 rule applies
+### Required radio-side settings for Bluetooth
 
-Bluetooth SPP just carries the same DDT2 bytes that the USB path carries — it's a different pipe into the same radio. **Menu 614 (Data TX End Timing) still has to be set to `0.5` seconds, not `Off`**, or the radio will silently swallow bytes no matter how perfect the Bluetooth link is. See [The Menu 614 gotcha](#the-menu-614-gotcha) below.
+Bluetooth SPP carries the same DDT2 bytes that the USB path carries — it's a different pipe into the same radio — so the full [one-time radio setup](#configuring-the-th-d75-for-macrats) below still applies. Two menus need particular attention before Bluetooth will carry DV data:
+
+- **Menu 984 (Data Band DV/DR Interface) must be set to `Bluetooth`** while MacRats is connecting over Bluetooth. The TH-D75 routes DV slow-data to exactly one interface at a time; leaving Menu 984 on `USB` is the single most common reason Bluetooth "connects" but carries no data. See [The Menu 984 gotcha](#the-menu-984-gotcha) below.
+- **Menu 614 (Data TX End Timing) must be set to `0.5` seconds, not `Off`**, regardless of transport. See [The Menu 614 gotcha](#the-menu-614-gotcha) below.
 
 ## Configuring the TH-D75 for MacRats
 
@@ -165,7 +173,7 @@ These front-panel menu settings are **required** before MacRats can make the rad
 | 3 | **Frequency** | `446.100 MHz` | Kenwood-documented simplex test frequency. Use any DV simplex freq you like once you're comfortable. |
 | 4 | **Destination** | `Local CQ` | `[F] [MODE] → Destination Select → Local CQ → ENT`. Sets `[TO]` to `CQCQCQ`. |
 | 5 | **Menu 650** — DV Gateway Mode | `Off` | NOT `Reflector TERM Mode`. Menu 650 is for Internet reflector operation via third-party MMDVM apps, not direct-radio D-Rats data. |
-| 6 | **Menu 984** — DV/DR mode PC I/O | `USB` | Routes the application data lane to the USB cable (vs Bluetooth). |
+| 6 | **Menu 984** — Data Band (DV/DR) Interface | `USB` *or* `Bluetooth` | **Must match the transport you're using.** Set to `USB` when connecting MacRats over USB, or `Bluetooth` when connecting over Bluetooth SPP. The TH-D75 routes DV slow-data to exactly one interface at a time — if this is wrong, your TX frames reach the radio over the wire you picked but the radio dumps them into the wrong subsystem, and nothing hits the air (or comes back from it). See [The Menu 984 gotcha](#the-menu-984-gotcha) below. |
 | 7 | **Menu 630** — GPS data TX mode | `Off` | Prevents NMEA sentences from being injected into the slow-data field alongside MacRats's DDT2 frames. |
 | 8 | **Menu 618** — Data Frame Output | `All` | Forwards all received D-STAR data to the USB port (vs filtering by callsign squelch). |
 | 9 | **Menu 614** — Data TX End Timing | **`0.5`** ← **GOTCHA** | **Must NOT be `Off`.** See note below. |
@@ -181,6 +189,24 @@ Setting Menu 614 to `0.5` (seconds) — the lowest non-Off value — restores no
 This is undocumented in the TH-D75 user manual, the IDM (Instruction Data Manual), and the D-Rats wiki. As far as we can tell, MacRats is the first project to hit and document this.
 
 If you're configuring a TH-D75 for any D-Rats-compatible client (MacRats, upstream D-Rats on Linux, or something else), **check Menu 614 first if the radio refuses to transmit.** This has a good chance of being the answer.
+
+### The Menu 984 gotcha
+
+The TH-D75 has four separate interface-routing menus — each data subsystem picks USB *or* Bluetooth as its target, independently:
+
+| Menu | Subsystem |
+| ---- | --------- |
+| **981** | PC I/O (CAT / MCP memory programming) |
+| **982** | PC Output — APRS |
+| **983** | Data Band (KISS) |
+| **984** | **Data Band (DV/DR)** ← what D-Rats / MacRats uses |
+| **985** | Data Band (DV Gateway) — for BlueDV and similar reflector apps |
+
+Each menu is a radio button, not a checkbox. The radio only routes DV slow-data to **one** interface at a time. If Menu 984 is set to `USB` but MacRats is connecting over Bluetooth, the radio accepts the Bluetooth SPP link at the transport level (the RFCOMM channel opens cleanly, the Bluetooth connected icon lights up, and writes `succeed`), but internally the DV/DR router ignores Bluetooth entirely. Your TX frames never reach the DV modem and inbound RX frames are delivered to the USB port that nothing is listening on. Symptom: TX looks fine, RX is completely silent, no errors anywhere.
+
+**Set Menu 984 to match the transport you're currently using.** Change it when you swap wires. This is particularly easy to miss because Menu 614 (and the rest of the radio setup) is unchanged — only the routing has to flip.
+
+MacRats discovered this during Bluetooth bring-up — the RFCOMM channel opened, `writeAsync` succeeded, the radio's Bluetooth icon was lit, but `RFCOMM RX +N bytes` lines never appeared in the bring-up log across multiple TX bursts. Confirmed transmission from a second receiver proved MacRats's bytes *were* hitting the air via USB-routed output, while the Bluetooth side got nothing because Menu 984 was pinned to `USB`.
 
 ## Connecting to a ratflector (no radio needed)
 
