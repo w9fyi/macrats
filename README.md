@@ -14,6 +14,7 @@ MacRats is **not** a fork of D-Rats. It is a clean-room implementation of the DD
 - ✅ CRC-16 + zlib compression, byte-for-byte compatible with Python upstream
 - ✅ D-Rats-compatible warmup frame (type 254, `"!"` stations, `[0x01]*16` payload) emitted before the first real frame after idle, matching `d_rats/transport.py` exactly
 - ✅ `USBSerialTransport` for Kenwood TH-D75 over USB-C (TIOCEXCL, manual DTR/RTS, POLLHUP detection, IOSSIOSPEED)
+- ✅ `BluetoothRFCOMMTransport` for Kenwood TH-D75 over Bluetooth SPP — direct IOBluetooth RFCOMM channel 2, `writeAsync` + `rfcommChannelData` delegate, Tahoe-compatible via `openRFCOMMChannelAsync`. TX verified over the air 2026-04-08
 - ✅ `TCPLoopbackTransport` for testing two MacRats instances on the same Mac
 - ✅ `DDT2FrameSplitter` — reassembles arbitrarily chunked inbound bytes
 - ✅ `WireLogger` — tailable `~/Downloads/MacRats/wire.log` file for bench debugging (VoiceOver-friendly via Terminal `tail -f`)
@@ -21,6 +22,7 @@ MacRats is **not** a fork of D-Rats. It is a clean-room implementation of the DD
 - ✅ Chat session state machine (T_DEF / T_PNG_REQ / T_PNG_RSP / T_PNG_ERQ / T_PNG_ERS / T_STATUS)
 - ✅ Sign-on / sign-off automatic broadcasts on connect/disconnect (500 ms post-signoff delay on serial for TX tail-out)
 - ✅ Station status broadcasts (online / unattended / offline + free-form message)
+- ✅ Fixed-position GPS beacon — D-Rats APRS `$$CRC` format, byte-for-byte compatible with upstream's `GPSPosition.to_aprs()` + `gpsa_checksum()`. Send-on-demand button in the GPS preferences tab; received beacons update the heard-station list with latitude/longitude/comment and appear as green entries in the chat log
 - ✅ Chat log persistence to disk (NDJSON, rotating)
 - ✅ SwiftUI app shell: `NavigationSplitView` with stations sidebar + chat view
 - ✅ First-run setup wizard (callsign → connection → device → finish)
@@ -34,16 +36,16 @@ MacRats is **not** a fork of D-Rats. It is a clean-room implementation of the DD
 
 ### Planned
 
-- ⬜ Phase 3 — receive-side test against a second D-Rats-compatible station (needs a peer)
-- ⬜ Bluetooth SPP transport (v1.1 — needs `BluetoothCoordinator` to bring up RFCOMM channel 2)
+- ⬜ Phase 3 — receive-side test against a second D-Rats-compatible station (needs a peer). Applies to both USB RX and Bluetooth RX verification, plus inbound GPS beacon decoding.
+- ⬜ File transfer sessions (`StatefulSession` reliability layer + `FileTransferSession` on top + drag-and-drop UI — v1.1)
 - ⬜ Events tab + sound alerts (v1.1)
 - ⬜ Map view with MapKit + offline tiles (v1.2)
-- ⬜ File transfer sessions, structured form messages, Winlink (v1.2+ — see `memory/macrats_feature_parity.md` for the full matrix)
+- ⬜ Structured form messages (ICS-213, etc.), Winlink email gateway (v1.2+ — see `memory/macrats_feature_parity.md` for the full matrix)
 
 ## Test status
 
 ```text
-192 tests, 19 suites, all passing in ~3 seconds.
+236 tests, 21 suites, all passing in ~3 seconds.
 ```
 
 - Every golden vector from upstream Python D-Rats is reproduced byte-for-byte
@@ -53,7 +55,9 @@ MacRats is **not** a fork of D-Rats. It is a clean-room implementation of the DD
 - `WireLoggerTests` (11 tests) verify the bench-debugging log file
 - `RatflectorHandshakeTests` (13 tests) cover every branch of the text-based auth flow (code 100, 101→200, 101→102→200, 101→500, timeout→old-school, EOF→old-school, unknown code, missing callsign, missing password, rejected password, etc.)
 - `RatflectorDirectoryTests` (17 tests) including the real captured `ratflectors.yml` fixture
-- **Live on-air test passed** against a real Kenwood TH-D75 on 446.100 MHz simplex D-STAR (2026-04-07)
+- `GPSBeaconTests` (22 tests) covering the APRS checksum, `deg2nmea` / `nmea2deg`, encode of three golden vectors (Austin, Chicago, Southern hemisphere), comment clipping, station-name space-to-dash conversion, and the full encode→decode roundtrip
+- **Live USB over-the-air test passed** against a real Kenwood TH-D75 on 446.100 MHz simplex D-STAR (2026-04-07)
+- **Live Bluetooth over-the-air TX test passed** against the same TH-D75 (2026-04-08) — chat frames transmitted over Bluetooth SPP, confirmed with a second receiver. RX verification pending a second station.
 - **Live Internet test passed** against `sewx.ratflector.com:9000` — handshake, broadcast send, clean disconnect (2026-04-07)
 
 ## Why a Swift rewrite
