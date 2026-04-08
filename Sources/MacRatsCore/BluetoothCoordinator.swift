@@ -71,25 +71,63 @@ public final class BluetoothCoordinator {
         }
     }
 
-    public enum CoordinatorError: Error, CustomStringConvertible {
+    public enum CoordinatorError: LocalizedError, CustomStringConvertible {
         case deviceNotFound(address: String)
         case aclConnectionFailed(code: Int32)
-        case rfcommChannelFailed(code: Int32)
+        case rfcommChannelFailed(code: Int32, channelID: Int, reason: String)
         case portDidNotAppear
         case permissionDenied
+
+        public var errorDescription: String? { description }
 
         public var description: String {
             switch self {
             case .deviceNotFound(let address):
                 return "Bluetooth device \(address) is not paired. Pair the radio in System Settings → Bluetooth first."
             case .aclConnectionFailed(let code):
-                return "Bluetooth ACL connection failed (IOReturn \(code)). Make sure the radio is powered on and in range."
-            case .rfcommChannelFailed(let code):
-                return "Could not open RFCOMM channel 2 on the radio (IOReturn \(code)). Try power-cycling the radio's Bluetooth."
+                return "Bluetooth ACL connection failed (IOReturn \(Self.formatIOReturn(code))). Make sure the radio is powered on and in range."
+            case .rfcommChannelFailed(let code, let channelID, let reason):
+                return "Could not open RFCOMM channel \(channelID) on the radio: \(reason) (IOReturn \(Self.formatIOReturn(code))). \(Self.suggestedFix(for: code))"
             case .portDidNotAppear:
                 return "The Bluetooth serial port did not appear within the timeout. Try turning the radio off and on."
             case .permissionDenied:
                 return "macOS denied Bluetooth permission for MacRats. Check System Settings → Privacy & Security → Bluetooth."
+            }
+        }
+
+        /// Produce a human-friendly representation of an IOReturn value.
+        /// Recognizes the codes we actually hit on macOS and prints the
+        /// raw hex for anything else so the user can paste it into a bug
+        /// report.
+        private static func formatIOReturn(_ code: Int32) -> String {
+            let hex = String(format: "0x%08X", UInt32(bitPattern: code))
+            switch code {
+            case kIOReturnSuccess:          return "success (\(hex))"
+            case kIOReturnBusy:             return "kIOReturnBusy (\(hex)) — another app or process has the radio open"
+            case kIOReturnNotPermitted:     return "kIOReturnNotPermitted (\(hex)) — macOS TCC blocked the operation"
+            case kIOReturnNoDevice:         return "kIOReturnNoDevice (\(hex)) — device not reachable"
+            case kIOReturnNotOpen:          return "kIOReturnNotOpen (\(hex)) — no baseband connection"
+            case kIOReturnExclusiveAccess:  return "kIOReturnExclusiveAccess (\(hex)) — channel already held by another client"
+            case kIOReturnTimeout:          return "kIOReturnTimeout (\(hex)) — the radio did not respond in time"
+            case kIOReturnAborted:          return "kIOReturnAborted (\(hex)) — the operation was cancelled"
+            case kIOReturnCannotWire:       return "kIOReturnCannotWire (\(hex))"
+            case kIOReturnNotFound:         return "kIOReturnNotFound (\(hex)) — the requested RFCOMM channel ID is not served by this radio"
+            default:                        return "\(code) (\(hex))"
+            }
+        }
+
+        private static func suggestedFix(for code: Int32) -> String {
+            switch code {
+            case kIOReturnBusy, kIOReturnExclusiveAccess:
+                return "Another application is holding this channel. Quit D-Rats, Serial, CoolTerm, or any other terminal app that might be connected to the radio and try again."
+            case kIOReturnNotPermitted:
+                return "Open System Settings → Privacy & Security → Bluetooth and make sure MacRats is allowed."
+            case kIOReturnNoDevice, kIOReturnNotOpen, kIOReturnTimeout:
+                return "Toggle Bluetooth off and back on at the radio's front panel, then try again."
+            case kIOReturnNotFound:
+                return "The radio did not advertise the expected SPP service. Unpair and re-pair the radio in System Settings → Bluetooth, then try again."
+            default:
+                return "Try power-cycling the radio's Bluetooth."
             }
         }
     }
@@ -183,35 +221,73 @@ public final class BluetoothCoordinator {
             try? await Task.sleep(nanoseconds: 2_000_000_000)
         }
 
-        // Step 2: open RFCOMM channel 2 and hold the reference.
-        var channel: IOBluetoothRFCOMMChannel?
-        var openResult = device.openRFCOMMChannelSync(
-            &channel,
-            withChannelID: BluetoothRFCOMMChannelID(2),
-            delegate: nil
-        )
+        // Step 2: figure out which RFCOMM channel(s) to try and open one.
+        //
+        // The TH-D75 historically uses channel 2 for its data path (this
+        // is documented in the sibling th-programmer project via the
+        // d75link binary), but firmware and pairing variations can shift
+        // that number. We therefore:
+        //
+        //   1. Perform an SDP query so the device's service records are
+        //      populated (cached records after ad-hoc resigning can be
+        //      stale or empty)
+        //   2. Enumerate advertised RFCOMM channels from the SDP records
+        //   3. Prepend channel 2 if it's not already in the list (so we
+        //      still catch the d75link path)
+        //   4. Try each candidate in order and stop on the first success
+        //
+        // Each attempt that fails is remembered so if the whole list is
+        // exhausted we can surface the most useful error to the user.
+        let candidates = await discoverRFCOMMCandidates(for: device)
 
-        // If we hit NotPermitted, macOS is showing (or about to show) the
-        // TCC Bluetooth permission prompt. Wait a moment, then retry once.
-        if openResult != kIOReturnSuccess && openResult == IOReturn(kIOReturnNotPermitted) {
-            try? await Task.sleep(nanoseconds: 1_500_000_000)
-            channel = nil
-            openResult = device.openRFCOMMChannelSync(
+        var lastError: Int32 = kIOReturnError
+        var lastReason = "no channels tried"
+
+        for candidate in candidates {
+            var channel: IOBluetoothRFCOMMChannel?
+            var openResult = device.openRFCOMMChannelSync(
                 &channel,
-                withChannelID: BluetoothRFCOMMChannelID(2),
+                withChannelID: BluetoothRFCOMMChannelID(candidate.channelID),
                 delegate: nil
             )
+
+            // TCC prompt handling: wait for the user to click Allow on
+            // the macOS Bluetooth permission dialog, then retry once.
             if openResult == IOReturn(kIOReturnNotPermitted) {
-                throw CoordinatorError.permissionDenied
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+                channel = nil
+                openResult = device.openRFCOMMChannelSync(
+                    &channel,
+                    withChannelID: BluetoothRFCOMMChannelID(candidate.channelID),
+                    delegate: nil
+                )
+                if openResult == IOReturn(kIOReturnNotPermitted) {
+                    throw CoordinatorError.permissionDenied
+                }
             }
+
+            if openResult == kIOReturnSuccess, let channel {
+                self.rfcommChannel = channel
+                self.currentDevice = device
+                lastError = kIOReturnSuccess
+                break
+            }
+
+            lastError = openResult
+            lastReason = candidate.source
+            // Small pause between attempts — the radio sometimes rate-limits
+            // rejected RFCOMM opens.
+            try? await Task.sleep(nanoseconds: 200_000_000)
         }
 
-        if openResult != kIOReturnSuccess {
-            throw CoordinatorError.rfcommChannelFailed(code: openResult)
+        if lastError != kIOReturnSuccess || self.rfcommChannel == nil {
+            let tried = candidates.map { "\($0.channelID)" }.joined(separator: ", ")
+            throw CoordinatorError.rfcommChannelFailed(
+                code: lastError,
+                channelID: candidates.last?.channelID ?? 2,
+                reason: "tried channel(s) \(tried); last source: \(lastReason)"
+            )
         }
-
-        self.rfcommChannel = channel
-        self.currentDevice = device
 
         // Step 3: poll up to 10 s for the /dev/cu.* device file to appear.
         for _ in 0..<20 {
@@ -226,6 +302,55 @@ public final class BluetoothCoordinator {
         // before throwing so we don't leak it.
         tearDownLink()
         throw CoordinatorError.portDidNotAppear
+    }
+
+    /// A single RFCOMM channel we're going to try, plus a short label for
+    /// error messages explaining where the channel ID came from.
+    private struct RFCOMMCandidate {
+        let channelID: Int
+        let source: String
+    }
+
+    /// Run an SDP query against the device and return the list of RFCOMM
+    /// channels it advertises, in preference order. Always ends with the
+    /// d75link hard-coded fallback (channel 2) and channels 1 and 3 as
+    /// last-ditch attempts, since some paired TH-D7x instances return
+    /// empty SDP records after ad-hoc resigning.
+    private func discoverRFCOMMCandidates(for device: IOBluetoothDevice) async -> [RFCOMMCandidate] {
+        // Kick off an SDP query first — the cached records may be empty
+        // or stale after a re-pair.
+        _ = device.performSDPQuery(nil)
+        try? await Task.sleep(nanoseconds: 1_500_000_000)
+
+        var candidates: [RFCOMMCandidate] = []
+        var seenIDs = Set<Int>()
+
+        func addCandidate(_ id: Int, source: String) {
+            guard id > 0, !seenIDs.contains(id) else { return }
+            seenIDs.insert(id)
+            candidates.append(RFCOMMCandidate(channelID: id, source: source))
+        }
+
+        // Collect every RFCOMM channel ID from every SDP service record.
+        // We don't filter by service UUID — we just want any channel the
+        // radio has offered. The TH-D75's data channel has been reported
+        // to not always be tagged with the standard SPP UUID.
+        if let services = device.services as? [IOBluetoothSDPServiceRecord] {
+            for service in services {
+                var channelID: BluetoothRFCOMMChannelID = 0
+                if service.getRFCOMMChannelID(&channelID) == kIOReturnSuccess {
+                    addCandidate(Int(channelID), source: "SDP record")
+                }
+            }
+        }
+
+        // Always try the historical TH-D75 data channel (from d75link).
+        addCandidate(2, source: "TH-D75 hard-coded fallback")
+        // And a couple of common SPP channel numbers as last resorts.
+        addCandidate(1, source: "generic SPP channel 1 fallback")
+        addCandidate(3, source: "generic SPP channel 3 fallback")
+
+        return candidates
     }
 
     /// Tear down the RFCOMM channel (and by extension the cu.* device file).
