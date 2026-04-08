@@ -129,18 +129,80 @@ final class MacRatsStore: ObservableObject {
         isBringingUpBluetooth = true
         let coordinator = bluetoothCoordinator
 
+        // Stream every trace line from the coordinator into the debug
+        // log as it happens, so the user can tail the bring-up live
+        // instead of waiting for a success or failure to see anything.
+        coordinator.onDiagnosticLine = { [weak self] line in
+            guard let self else { return }
+            Task { @MainActor in
+                self.debugLog.append("[BT] " + line)
+                if self.debugLog.count > 500 {
+                    self.debugLog.removeFirst(self.debugLog.count - 500)
+                }
+            }
+        }
+
         Task { @MainActor in
-            defer { self.isBringingUpBluetooth = false }
+            defer {
+                self.isBringingUpBluetooth = false
+                coordinator.onDiagnosticLine = nil
+            }
             do {
                 let path = try await coordinator.bringUpLink(addressString: address)
+                // Write the success trace too — useful to confirm which
+                // RFCOMM channel actually worked on the user's hardware.
+                Self.writeBluetoothLog(
+                    header: "SUCCESS — resolved path: \(path)",
+                    trace: coordinator.lastDiagnosticTrace
+                )
                 try self.model.connect(bluetoothPortPath: path)
             } catch {
-                self.lastErrorMessage = error.localizedDescription
-                // If we got the RFCOMM link up but model.connect() failed,
-                // tear the link back down so we don't leak the channel.
+                let logPath = Self.writeBluetoothLog(
+                    header: "FAILED — \(error.localizedDescription)",
+                    trace: coordinator.lastDiagnosticTrace
+                )
+                let logHint = logPath.map { "\n\nFull bring-up trace written to \($0) — please include that file if reporting this as a bug." } ?? ""
+                self.lastErrorMessage = error.localizedDescription + logHint
                 coordinator.tearDownLink()
             }
         }
+    }
+
+    /// Write a Bluetooth bring-up trace to `~/Downloads/MacRats/bluetooth.log`,
+    /// appending to any existing file. Returns the path on success.
+    @discardableResult
+    private static func writeBluetoothLog(header: String,
+                                          trace: [String]) -> String? {
+        let fm = FileManager.default
+        guard let downloads = try? fm.url(for: .downloadsDirectory,
+                                          in: .userDomainMask,
+                                          appropriateFor: nil,
+                                          create: true) else {
+            return nil
+        }
+        let dir = downloads.appendingPathComponent("MacRats", isDirectory: true)
+        if !fm.fileExists(atPath: dir.path) {
+            try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        let logURL = dir.appendingPathComponent("bluetooth.log")
+
+        var text = "\n=== \(ISO8601DateFormatter().string(from: Date())) ===\n"
+        text += header + "\n"
+        for line in trace {
+            text += line + "\n"
+        }
+        text += "=== end ===\n"
+
+        guard let data = text.data(using: .utf8) else { return nil }
+        if fm.fileExists(atPath: logURL.path),
+           let handle = try? FileHandle(forWritingTo: logURL) {
+            defer { try? handle.close() }
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: data)
+        } else {
+            try? data.write(to: logURL, options: .atomic)
+        }
+        return logURL.path
     }
 
     /// Disconnect MacRats and tear down the Bluetooth link if one is up.

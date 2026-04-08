@@ -139,7 +139,35 @@ public final class BluetoothCoordinator {
     /// The device we're currently linked to. Cleared on teardown.
     private var currentDevice: IOBluetoothDevice?
 
+    /// Human-readable trace of what happened during the most recent
+    /// `bringUpLink` call. Populated step-by-step as the coordinator
+    /// walks through ACL open, SDP query, service enumeration, and
+    /// RFCOMM channel attempts. The trace is embedded in any thrown
+    /// `CoordinatorError` so the caller can show it in a debug log
+    /// and the user can paste it into a bug report.
+    public private(set) var lastDiagnosticTrace: [String] = []
+
+    /// Observer callback fired for every trace line the moment it is
+    /// appended. Lets the UI tail the bring-up live in the debug log
+    /// instead of waiting for a success or failure before seeing the
+    /// whole sequence. Called on whatever thread the coordinator
+    /// happens to be on.
+    public var onDiagnosticLine: (@Sendable (String) -> Void)?
+
     public init() {}
+
+    private func trace(_ line: String) {
+        let ts = Self.traceTimestamp()
+        let full = "[\(ts)] \(line)"
+        lastDiagnosticTrace.append(full)
+        onDiagnosticLine?(full)
+    }
+
+    private nonisolated static func traceTimestamp() -> String {
+        let df = DateFormatter()
+        df.dateFormat = "HH:mm:ss.SSS"
+        return df.string(from: Date())
+    }
 
     // MARK: - Enumeration
 
@@ -198,27 +226,45 @@ public final class BluetoothCoordinator {
     /// and reopens.
     public func bringUpLink(addressString: String) async throws -> String {
         tearDownLink()
+        lastDiagnosticTrace.removeAll()
+
+        trace("bringUpLink start: address=\(addressString)")
+        trace("macOS: \(ProcessInfo.processInfo.operatingSystemVersionString)")
 
         guard let device = IOBluetoothDevice(addressString: addressString) else {
+            trace("ERROR: IOBluetoothDevice(addressString:) returned nil")
             throw CoordinatorError.deviceNotFound(address: addressString)
         }
+        trace("device: name=\(device.name ?? "(nil)") classOfDevice=\(String(format: "0x%08X", device.classOfDevice))")
+        trace("device.isConnected() = \(device.isConnected())")
 
         // Step 1: open the ACL connection. If the device reports "connected"
         // but no cu.* file exists, the baseband connection is stale (e.g.
         // radio power-cycled) — close and reopen.
-        if device.isConnected() && Self.findPortPath(forDeviceName: device.name ?? "",
-                                                     addressString: addressString) == nil {
+        let existingPort = Self.findPortPath(forDeviceName: device.name ?? "",
+                                             addressString: addressString)
+        trace("existing cu.* file: \(existingPort ?? "(none)")")
+
+        if device.isConnected() && existingPort == nil {
+            trace("ACL is up but no cu.* file — closing stale baseband link")
             device.closeConnection()
             try? await Task.sleep(nanoseconds: 1_000_000_000)
+            trace("post-close device.isConnected() = \(device.isConnected())")
         }
 
         if !device.isConnected() {
+            trace("calling device.openConnection()")
             let aclResult = device.openConnection()
+            trace("openConnection() returned \(Self.describeIOReturn(aclResult))")
             if aclResult != kIOReturnSuccess {
                 throw CoordinatorError.aclConnectionFailed(code: aclResult)
             }
             // Let macOS finish the baseband handshake.
+            trace("sleeping 2s for baseband handshake")
             try? await Task.sleep(nanoseconds: 2_000_000_000)
+            trace("post-sleep device.isConnected() = \(device.isConnected())")
+        } else {
+            trace("skipping ACL open — device already connected")
         }
 
         // Step 2: figure out which RFCOMM channel(s) to try and open one.
@@ -244,16 +290,19 @@ public final class BluetoothCoordinator {
         var lastReason = "no channels tried"
 
         for candidate in candidates {
+            trace("attempt RFCOMM open: channel=\(candidate.channelID) source=\(candidate.source)")
             var channel: IOBluetoothRFCOMMChannel?
             var openResult = device.openRFCOMMChannelSync(
                 &channel,
                 withChannelID: BluetoothRFCOMMChannelID(candidate.channelID),
                 delegate: nil
             )
+            trace("  sync open → \(Self.describeIOReturn(openResult)) channel=\(channel == nil ? "nil" : "non-nil")")
 
             // TCC prompt handling: wait for the user to click Allow on
             // the macOS Bluetooth permission dialog, then retry once.
             if openResult == IOReturn(kIOReturnNotPermitted) {
+                trace("  kIOReturnNotPermitted — waiting 1.5s for TCC prompt")
                 try? await Task.sleep(nanoseconds: 1_500_000_000)
                 channel = nil
                 openResult = device.openRFCOMMChannelSync(
@@ -261,12 +310,14 @@ public final class BluetoothCoordinator {
                     withChannelID: BluetoothRFCOMMChannelID(candidate.channelID),
                     delegate: nil
                 )
+                trace("  retry sync open → \(Self.describeIOReturn(openResult))")
                 if openResult == IOReturn(kIOReturnNotPermitted) {
                     throw CoordinatorError.permissionDenied
                 }
             }
 
             if openResult == kIOReturnSuccess, let channel {
+                trace("  RFCOMM channel \(candidate.channelID) OPEN — keeping reference alive")
                 self.rfcommChannel = channel
                 self.currentDevice = device
                 lastError = kIOReturnSuccess
@@ -319,7 +370,9 @@ public final class BluetoothCoordinator {
     private func discoverRFCOMMCandidates(for device: IOBluetoothDevice) async -> [RFCOMMCandidate] {
         // Kick off an SDP query first — the cached records may be empty
         // or stale after a re-pair.
-        _ = device.performSDPQuery(nil)
+        let sdpResult = device.performSDPQuery(nil)
+        trace("performSDPQuery() returned \(Self.describeIOReturn(sdpResult))")
+        trace("sleeping 1.5s for SDP query to complete")
         try? await Task.sleep(nanoseconds: 1_500_000_000)
 
         var candidates: [RFCOMMCandidate] = []
@@ -336,12 +389,20 @@ public final class BluetoothCoordinator {
         // radio has offered. The TH-D75's data channel has been reported
         // to not always be tagged with the standard SPP UUID.
         if let services = device.services as? [IOBluetoothSDPServiceRecord] {
-            for service in services {
+            trace("device.services: \(services.count) service record(s)")
+            for (idx, service) in services.enumerated() {
+                let serviceName = service.getServiceName() ?? "(no name)"
                 var channelID: BluetoothRFCOMMChannelID = 0
-                if service.getRFCOMMChannelID(&channelID) == kIOReturnSuccess {
-                    addCandidate(Int(channelID), source: "SDP record")
+                let chResult = service.getRFCOMMChannelID(&channelID)
+                if chResult == kIOReturnSuccess {
+                    trace("  service[\(idx)] name=\(serviceName) RFCOMM channel=\(channelID)")
+                    addCandidate(Int(channelID), source: "SDP: \(serviceName)")
+                } else {
+                    trace("  service[\(idx)] name=\(serviceName) — not RFCOMM (getRFCOMMChannelID → \(Self.describeIOReturn(chResult)))")
                 }
             }
+        } else {
+            trace("device.services: nil or unexpected type")
         }
 
         // Always try the historical TH-D75 data channel (from d75link).
@@ -350,7 +411,31 @@ public final class BluetoothCoordinator {
         addCandidate(1, source: "generic SPP channel 1 fallback")
         addCandidate(3, source: "generic SPP channel 3 fallback")
 
+        trace("RFCOMM candidates to try (in order): \(candidates.map { "ch\($0.channelID)" }.joined(separator: ", "))")
         return candidates
+    }
+
+    /// Short IOReturn renderer for trace lines. Different from
+    /// `CoordinatorError.formatIOReturn` (which is verbose with
+    /// suggested fixes) — this one is compact for log scroll-back.
+    private nonisolated static func describeIOReturn(_ code: Int32) -> String {
+        let hex = String(format: "0x%08X", UInt32(bitPattern: code))
+        let named: String
+        switch code {
+        case kIOReturnSuccess:          named = "success"
+        case kIOReturnError:            named = "kIOReturnError (generic)"
+        case kIOReturnBusy:             named = "kIOReturnBusy"
+        case kIOReturnNotPermitted:     named = "kIOReturnNotPermitted"
+        case kIOReturnNoDevice:         named = "kIOReturnNoDevice"
+        case kIOReturnNotOpen:          named = "kIOReturnNotOpen"
+        case kIOReturnExclusiveAccess:  named = "kIOReturnExclusiveAccess"
+        case kIOReturnTimeout:          named = "kIOReturnTimeout"
+        case kIOReturnAborted:          named = "kIOReturnAborted"
+        case kIOReturnNotFound:         named = "kIOReturnNotFound"
+        case kIOReturnUnsupported:      named = "kIOReturnUnsupported"
+        default:                        named = "IOReturn(\(code))"
+        }
+        return "\(named) \(hex)"
     }
 
     /// Tear down the RFCOMM channel (and by extension the cu.* device file).
