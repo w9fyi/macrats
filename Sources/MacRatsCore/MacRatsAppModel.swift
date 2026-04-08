@@ -53,6 +53,24 @@ public final class MacRatsAppModel: @unchecked Sendable {
     private var chatSession: ChatSession?
     private var chatDelegateShim: ChatDelegateShim?
 
+    /// The currently active file transfer session, if any. MacRats
+    /// supports one transfer at a time in v0.1 — start a second one
+    /// while the first is running and you get an error.
+    private var fileTransferSession: FileTransferSession?
+    private var fileTransferDelegateShim: FileTransferDelegateShim?
+
+    /// Fixed session id used for the single-file-at-a-time file
+    /// transfer slot. Both peers must use the same id (see the
+    /// StatefulSession / FileTransferSession docs — MacRats does not
+    /// implement the session open handshake, so ids are agreed out
+    /// of band via this constant).
+    public static let fileTransferSessionID: UInt8 = 3
+
+    /// Throttle for progress-reporting chat-log entries. We only
+    /// emit a new system-event line every 10% of the transfer, so a
+    /// 1 MB push doesn't fill the chat log with 200 progress lines.
+    private var lastProgressPercentLogged: Int = -10
+
     /// Where settings are persisted. Injected for testability.
     public let settingsURL: URL?
 
@@ -355,6 +373,17 @@ public final class MacRatsAppModel: @unchecked Sendable {
     /// connection BEFORE tearing it down. If the connection is already
     /// dead this send is silently skipped.
     public func disconnect() {
+        // Cancel any in-progress file transfer so its worker thread
+        // exits cleanly. forceClose() drops queued and outstanding
+        // blocks immediately rather than trying to drain them over a
+        // transport that's about to close.
+        lock.lock()
+        let activeTransfer = fileTransferSession
+        fileTransferSession = nil
+        fileTransferDelegateShim = nil
+        lock.unlock()
+        activeTransfer?.forceClose()
+
         sendSignOffIfNeeded()
         manager?.disconnect()
         manager = nil
@@ -487,6 +516,184 @@ public final class MacRatsAppModel: @unchecked Sendable {
                            dStation: "CQCQCQ",
                            text: s.gpsComment.isEmpty ? "Position fix" : s.gpsComment,
                            outgoing: true))
+    }
+
+    // MARK: - File transfer
+
+    public enum FileTransferModelError: Error, LocalizedError {
+        case alreadyActive
+        case notConnected
+        case underlying(String)
+
+        public var errorDescription: String? {
+            switch self {
+            case .alreadyActive:
+                return "A file transfer is already in progress. Cancel it or wait for it to finish before starting another."
+            case .notConnected:
+                return "Not connected. Connect to a radio, TCP loopback, or ratflector before starting a file transfer."
+            case .underlying(let msg):
+                return msg
+            }
+        }
+    }
+
+    /// Begin sending a file to a remote peer. Creates a sender
+    /// `FileTransferSession`, registers it at the reserved file
+    /// transfer session id, and starts the D-Rats file wire protocol.
+    /// Progress + completion are surfaced as system events in the
+    /// chat log. Only one transfer (send OR receive) can be active
+    /// at a time — starting a second one while the first is running
+    /// throws `alreadyActive`.
+    public func sendFile(url: URL, to remoteStation: String) throws {
+        guard let manager else {
+            throw FileTransferModelError.notConnected
+        }
+
+        lock.lock()
+        if fileTransferSession != nil {
+            lock.unlock()
+            throw FileTransferModelError.alreadyActive
+        }
+        let session = FileTransferSession(remoteStation: remoteStation,
+                                           role: .sender)
+        let shim = FileTransferDelegateShim(owner: self)
+        session.fileDelegate = shim
+        fileTransferSession = session
+        fileTransferDelegateShim = shim
+        lastProgressPercentLogged = -10
+        lock.unlock()
+
+        manager.add(session, id: Self.fileTransferSessionID)
+
+        do {
+            try session.sendFile(url: url)
+            appendSystemEvent("Sending \(url.lastPathComponent) to \(remoteStation)…")
+        } catch {
+            clearFileTransfer()
+            appendSystemEvent("File send failed: \(error.localizedDescription)")
+            throw FileTransferModelError.underlying(error.localizedDescription)
+        }
+    }
+
+    /// Arm MacRats to receive an incoming file from a remote peer.
+    /// The caller supplies the station callsign (so we know who to
+    /// expect) and a directory to save the received file into. The
+    /// session stays armed until a file arrives, the user cancels,
+    /// or the transport disconnects.
+    public func prepareToReceiveFile(from remoteStation: String,
+                                      saveTo directory: URL) throws {
+        guard let manager else {
+            throw FileTransferModelError.notConnected
+        }
+
+        lock.lock()
+        if fileTransferSession != nil {
+            lock.unlock()
+            throw FileTransferModelError.alreadyActive
+        }
+        let session = FileTransferSession(remoteStation: remoteStation,
+                                           role: .receiver)
+        let shim = FileTransferDelegateShim(owner: self)
+        session.fileDelegate = shim
+        fileTransferSession = session
+        fileTransferDelegateShim = shim
+        lastProgressPercentLogged = -10
+        lock.unlock()
+
+        manager.add(session, id: Self.fileTransferSessionID)
+
+        do {
+            try session.startReceiving(saveTo: directory)
+            appendSystemEvent("Waiting for file from \(remoteStation)…")
+        } catch {
+            clearFileTransfer()
+            appendSystemEvent("File receive arm failed: \(error.localizedDescription)")
+            throw FileTransferModelError.underlying(error.localizedDescription)
+        }
+    }
+
+    /// Cancel any in-progress or pending file transfer. No-op if
+    /// nothing is active. Used by the Cancel button and on transport
+    /// disconnect.
+    public func cancelFileTransfer() {
+        lock.lock()
+        let session = fileTransferSession
+        lock.unlock()
+
+        guard let session else { return }
+
+        // forceClose gets the worker to exit immediately, which then
+        // fires the didClose or didFail delegate callback that in
+        // turn calls clearFileTransfer() to release the slot.
+        session.forceClose()
+        appendSystemEvent("File transfer cancelled.")
+    }
+
+    /// Called by the delegate shim after the session has reached a
+    /// terminal state (complete, failed, or cancelled). Unregisters
+    /// the session from the manager and nils out our slot.
+    fileprivate func clearFileTransfer() {
+        lock.lock()
+        let session = fileTransferSession
+        fileTransferSession = nil
+        fileTransferDelegateShim = nil
+        lock.unlock()
+
+        if let session, let manager {
+            manager.remove(session)
+        }
+    }
+
+    /// Called by the delegate shim on every progress update. Throttles
+    /// to 10% increments so the chat log doesn't drown in updates.
+    fileprivate func handleFileTransferProgress(_ session: FileTransferSession,
+                                                  bytesReceived: Int,
+                                                  totalBytes: Int) {
+        guard totalBytes > 0 else { return }
+        let percent = (bytesReceived * 100) / totalBytes
+
+        lock.lock()
+        guard percent >= lastProgressPercentLogged + 10 else {
+            lock.unlock()
+            return
+        }
+        lastProgressPercentLogged = percent
+        lock.unlock()
+
+        let verb = session.role == .sender ? "Sent" : "Received"
+        appendSystemEvent("\(verb) \(percent)%")
+    }
+
+    fileprivate func handleFileTransferBegin(filename: String, total: Int) {
+        // "Sending x" already logged by sendFile(); receiver side wants
+        // a begin line now that it knows what's coming.
+        lock.lock()
+        let isReceiver = (fileTransferSession?.role == .receiver)
+        lock.unlock()
+        if isReceiver {
+            appendSystemEvent("Incoming file: \(filename) (\(total) bytes)")
+        }
+    }
+
+    fileprivate func handleFileTransferComplete(_ session: FileTransferSession, fileURL: URL) {
+        let verb = session.role == .sender ? "Sent" : "Received"
+        appendSystemEvent("\(verb) file: \(fileURL.lastPathComponent)")
+        clearFileTransfer()
+    }
+
+    fileprivate func handleFileTransferFailed(_ session: FileTransferSession, reason: String) {
+        appendSystemEvent("File transfer failed: \(reason)")
+        clearFileTransfer()
+    }
+
+    /// Append a `.systemEvent` chat log entry. Used by file transfer
+    /// progress reports and other internal events the user should see.
+    private func appendSystemEvent(_ text: String) {
+        append(ChatMessage(kind: .systemEvent,
+                           sStation: "",
+                           dStation: "",
+                           text: text,
+                           outgoing: false))
     }
 
     // MARK: - Internal state transitions
@@ -646,5 +853,39 @@ private final class ChatDelegateShim: ChatSession.Delegate, @unchecked Sendable 
 
     func chatSession(_ session: ChatSession, didReceiveGPSFix fix: GPSBeacon.Fix) {
         owner?.handleIncomingGPSFix(fix)
+    }
+}
+
+/// Delegate shim for `FileTransferSession`. Same pattern as
+/// `ChatDelegateShim` — keeps `MacRatsAppModel`'s public surface free
+/// of the delegate methods while still providing a long-lived target
+/// for the session to hold.
+private final class FileTransferDelegateShim: FileTransferSession.FileTransferDelegate, @unchecked Sendable {
+    weak var owner: MacRatsAppModel?
+
+    init(owner: MacRatsAppModel) {
+        self.owner = owner
+    }
+
+    func fileTransferDidBegin(_ session: FileTransferSession,
+                               filename: String,
+                               totalBytes: Int) {
+        owner?.handleFileTransferBegin(filename: filename, total: totalBytes)
+    }
+
+    func fileTransfer(_ session: FileTransferSession,
+                       didProgressTo bytesReceived: Int,
+                       of totalBytes: Int) {
+        owner?.handleFileTransferProgress(session,
+                                           bytesReceived: bytesReceived,
+                                           totalBytes: totalBytes)
+    }
+
+    func fileTransferDidComplete(_ session: FileTransferSession, fileURL: URL) {
+        owner?.handleFileTransferComplete(session, fileURL: fileURL)
+    }
+
+    func fileTransfer(_ session: FileTransferSession, didFailWith reason: String) {
+        owner?.handleFileTransferFailed(session, reason: reason)
     }
 }

@@ -38,6 +38,26 @@ struct MacRatsApp: App {
                 .keyboardShortcut("k", modifiers: [.command, .shift])
             }
             CommandGroup(replacing: .newItem) { }
+            CommandMenu("File Transfer") {
+                Button("Send File…") {
+                    FileTransferCommands.runSendFile(store: store)
+                }
+                .disabled(store.connectionStatus != .connected)
+                .keyboardShortcut("s", modifiers: [.command, .shift])
+
+                Button("Prepare to Receive File…") {
+                    FileTransferCommands.runReceiveFile(store: store)
+                }
+                .disabled(store.connectionStatus != .connected)
+                .keyboardShortcut("r", modifiers: [.command, .shift])
+
+                Divider()
+
+                Button("Cancel File Transfer") {
+                    store.cancelFileTransfer()
+                }
+                .keyboardShortcut(".", modifiers: [.command, .shift])
+            }
         }
 
         Settings {

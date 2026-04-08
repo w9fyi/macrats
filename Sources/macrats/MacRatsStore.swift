@@ -229,4 +229,31 @@ final class MacRatsStore: ObservableObject {
             lastErrorMessage = "Could not broadcast GPS beacon. Make sure you're connected and have set a fixed latitude and longitude in Preferences → GPS."
         }
     }
+
+    /// Start sending a file to a remote peer. Called from the
+    /// `File > Send File…` menu command. Any errors are routed into
+    /// `lastErrorMessage` so a SwiftUI alert can show them.
+    func sendFile(url: URL, to remoteStation: String) {
+        do {
+            try model.sendFile(url: url, to: remoteStation)
+        } catch {
+            lastErrorMessage = error.localizedDescription
+        }
+    }
+
+    /// Arm MacRats to receive an incoming file. Called from the
+    /// `File > Prepare to Receive File…` menu command.
+    func prepareToReceiveFile(from remoteStation: String, saveTo directory: URL) {
+        do {
+            try model.prepareToReceiveFile(from: remoteStation, saveTo: directory)
+        } catch {
+            lastErrorMessage = error.localizedDescription
+        }
+    }
+
+    /// Cancel any in-progress file transfer. No-op if nothing is
+    /// running. Called from the `File > Cancel File Transfer` menu.
+    func cancelFileTransfer() {
+        model.cancelFileTransfer()
+    }
 }
