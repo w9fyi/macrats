@@ -208,14 +208,11 @@ public final class MacRatsAppModel: @unchecked Sendable {
     /// Throws if settings are invalid. Idempotent — calling while already
     /// connected is a no-op.
     ///
-    /// `bluetoothPortPath` is the `/dev/cu.*` path produced by a live
-    /// `BluetoothCoordinator.bringUpLink(...)` call. The caller is
-    /// responsible for the IOBluetooth bring-up AND for holding the
-    /// coordinator alive for the lifetime of the connection (releasing the
-    /// coordinator's RFCOMM channel reference while connected will tear
-    /// down the cu.* file on the next GC tick). For non-Bluetooth
-    /// connection kinds this parameter is ignored.
-    public func connect(bluetoothPortPath: String? = nil) throws {
+    /// For the `.bluetooth` connection kind, `BluetoothRFCOMMTransport`
+    /// handles its own IOBluetooth bring-up asynchronously — callers do
+    /// not need to pre-resolve anything. For USB the configured device
+    /// path is opened directly.
+    public func connect() throws {
         lock.lock()
         if _connectionStatus == .connected || _connectionStatus == .connecting {
             lock.unlock()
@@ -239,15 +236,13 @@ public final class MacRatsAppModel: @unchecked Sendable {
         case .bluetooth:
             // The Bluetooth path uses BluetoothRFCOMMTransport, which
             // talks to RFCOMM channel 2 directly via IOBluetooth. The
-            // /dev/cu.* file is intentionally NOT used — bytes never
-            // traverse the kernel BT serial driver because on macOS the
-            // cu.* file is a stale shim for the TH-D75 (the SDP-
-            // advertised SPP service is wired to a different endpoint
-            // than the data TNC). The transport handles its own
-            // bring-up; the caller does not need to pre-resolve a path.
-            // The legacy `bluetoothPortPath` parameter is kept for
-            // source compatibility but ignored.
-            _ = bluetoothPortPath
+            // `/dev/cu.*` file is intentionally NOT used — on the
+            // TH-D75 the kernel BT serial driver is wired to a
+            // different endpoint than the radio's DV data TNC, so
+            // bytes written to `cu.*` go nowhere and reads never
+            // produce anything. The transport handles its own
+            // bring-up; the caller does not need to pre-resolve a
+            // path.
             #if canImport(IOBluetooth)
             let btAddress = settings.bluetoothRadioAddress
             guard !btAddress.isEmpty else {

@@ -84,9 +84,10 @@ public final class BluetoothRFCOMMTransport: NSObject, RadioTransport, @unchecke
     private static let maxConnectAttempts = 10
 
     /// Optional callback fired with each line of internal trace output.
-    /// MacRatsStore wires this to the same `bluetooth.log` writer that
-    /// `BluetoothCoordinator` uses, so the user gets a unified bring-up
-    /// log regardless of which path actually carries the traffic.
+    /// `MacRatsAppModel` forwards these into the app log so the user can
+    /// see bring-up progress live in the debug pane. The same lines are
+    /// also written directly to `~/Downloads/MacRats/bluetooth.log` by
+    /// the transport itself — see `appendBluetoothLog(_:)` below.
     public var onDiagnosticLine: (@Sendable (String) -> Void)?
 
     // MARK: - Internal state
@@ -442,10 +443,9 @@ public final class BluetoothRFCOMMTransport: NSObject, RadioTransport, @unchecke
         return df.string(from: Date())
     }
 
-    /// Append a trace line to `~/Downloads/MacRats/bluetooth.log`, the
-    /// same file `BluetoothCoordinator` writes to. Each line is preceded
-    /// by an ISO8601 session marker on the first call of a session.
-    /// Best-effort — failures to write are silent.
+    /// Append a trace line to `~/Downloads/MacRats/bluetooth.log`. Each
+    /// line is preceded by an ISO8601 session marker on the first call
+    /// of a session. Best-effort — failures to write are silent.
     private static let logWriteLock = NSLock()
     private static func appendBluetoothLog(_ line: String) {
         logWriteLock.lock()

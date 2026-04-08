@@ -8,20 +8,14 @@ import Darwin
 /// - Silicon Labs CP210x bridges (`/dev/cu.SLAB_USBtoUART*`)
 /// - FTDI USB-serial bridges (`/dev/cu.usbserial-*`)
 ///
-/// **Bluetooth SPP is intentionally NOT supported by this transport alone.**
-/// macOS does create a `/dev/cu.TH-D75` (or similar) device file for any paired
-/// Bluetooth SPP device, and `open()` against that file will succeed even when
-/// the radio's Bluetooth radio is off — but the file is a stale shim, not a
-/// live link. Bytes written to it go nowhere until an `IOBluetooth` ACL
-/// connection is established AND an `IOBluetoothRFCOMMChannel` reference is
-/// held alive in memory by the application. For the TH-D75 specifically, the
-/// data channel is RFCOMM channel 2 (not the SDP-advertised SPP channel).
-///
-/// v1.1 will add a `BluetoothCoordinator` that handles the IOBluetooth dance
-/// (modeled on the `th-programmer` project's `BluetoothManager.swift`) and
-/// then hands the resulting `/dev/cu.*` path to *this* transport class. The
-/// byte-pipe code below is reused unchanged for both USB and Bluetooth — only
-/// the connection lifecycle differs.
+/// **Bluetooth SPP is intentionally NOT supported by this transport.** macOS
+/// does create a `/dev/cu.TH-D75` device file for paired Bluetooth radios, and
+/// `open()` against that file even succeeds, but on the TH-D75 the kernel BT
+/// serial driver behind that file is wired to a different endpoint than the
+/// radio's DV data TNC. Writes go into the void and reads never deliver
+/// anything. The correct path for Bluetooth is `BluetoothRFCOMMTransport`,
+/// which holds an `IOBluetoothRFCOMMChannel` reference directly and speaks to
+/// the channel object rather than a POSIX device file.
 ///
 /// ## Implementation notes
 ///

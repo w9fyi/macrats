@@ -275,8 +275,7 @@ struct ConfigSheet: View {
     /// Pull paired TH-D74/D75 radios from `BluetoothCoordinator` and
     /// populate `pairedBluetoothRadios`. Main-actor-safe.
     private func refreshBluetoothRadios() {
-        let coordinator = store.bluetoothCoordinator
-        let radios = coordinator.pairedRadios()
+        let radios = BluetoothCoordinator.pairedRadios()
         pairedBluetoothRadios = radios.map { radio in
             BluetoothPairedRadioRow(
                 id: radio.address,

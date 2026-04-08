@@ -34,16 +34,12 @@ final class MacRatsStore: ObservableObject {
     /// Rolling debug log buffer — populated from `model.logHandler`.
     @Published private(set) var debugLog: [String] = []
 
-    /// Long-lived `BluetoothCoordinator` instance. Held here (not in the
-    /// AppModel) because IOBluetooth is a macOS-only framework and the
-    /// core model is intentionally UI-free. The coordinator's RFCOMM
-    /// channel reference must outlive the `USBSerialTransport` that uses
-    /// the virtual serial port — holding it on the Store (which lives
-    /// for the lifetime of the app) guarantees that.
-    let bluetoothCoordinator = BluetoothCoordinator()
-
     /// True while a Bluetooth link bring-up is in progress. The UI uses
     /// this to disable the Connect button and show a progress hint.
+    ///
+    /// `BluetoothCoordinator` is now a pure namespace (enum) for paired
+    /// radio enumeration — no instance to hold. The actual IOBluetooth
+    /// bring-up lives in `BluetoothRFCOMMTransport`.
     @Published private(set) var isBringingUpBluetooth = false
 
     init(model: MacRatsAppModel) {
@@ -95,11 +91,9 @@ final class MacRatsStore: ObservableObject {
     /// Attempt to connect, capturing any thrown error into
     /// `lastErrorMessage` so a SwiftUI alert can display it.
     ///
-    /// For `.bluetooth` kind this is a two-step process: first bring up
-    /// the IOBluetooth RFCOMM link via `BluetoothCoordinator`, then hand
-    /// the resolved `/dev/cu.*` path to `model.connect(bluetoothPortPath:)`.
-    /// The UI shows `isBringingUpBluetooth = true` during the async
-    /// bring-up so the Connect button can be disabled.
+    /// For the `.bluetooth` kind, `BluetoothRFCOMMTransport` owns its own
+    /// IOBluetooth bring-up — the store just flips `isBringingUpBluetooth`
+    /// for the UI hint and calls `model.connect()`.
     func tryConnect() {
         // Validation preflight before we even touch the session layer.
         if let validation = model.settings.connectionValidationError() {
