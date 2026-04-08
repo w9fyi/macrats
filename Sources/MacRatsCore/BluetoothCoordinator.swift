@@ -267,6 +267,54 @@ public final class BluetoothCoordinator {
             trace("skipping ACL open — device already connected")
         }
 
+        // Step 1.5: if macOS already created the /dev/cu.* device file,
+        // trust it and return early.
+        //
+        // On macOS Sonoma and earlier, the documented behavior (via the
+        // sibling th-programmer project) was that the cu.* file is a
+        // stale shim — bytes written to it go nowhere unless the app
+        // holds an IOBluetoothRFCOMMChannel reference alive. That made
+        // the bring-up require an explicit openRFCOMMChannelSync.
+        //
+        // On macOS Tahoe (26.x), that sync API appears to be broken:
+        // it blocks for ~3 seconds waiting for a delegate callback
+        // that never arrives and returns kIOReturnError even though
+        // a channel object is allocated. Trying every channel in
+        // {SDP-advertised, 2, 1, 3} produces the same result.
+        //
+        // Meanwhile, macOS itself has already paired the radio through
+        // System Settings, established an RFCOMM link from its own
+        // Bluetooth daemon, and created a live `/dev/cu.TH-D75` file
+        // managed entirely by the system. We should use that file,
+        // not fight the deprecated legacy API.
+        //
+        // Strategy:
+        //   1. Open the ACL connection (to make sure the baseband is up
+        //      and recover from stale cached state).
+        //   2. If the cu.* file exists, return it — trust that macOS
+        //      is managing the RFCOMM channel internally.
+        //   3. Only fall back to the explicit openRFCOMMChannelSync
+        //      dance if the cu.* file is missing, which would indicate
+        //      a platform where we still need to drive the RFCOMM open
+        //      ourselves.
+        //
+        // If bytes don't actually flow after this (i.e., the cu.* file
+        // is in fact a stale shim on Tahoe too), we'll need to move to
+        // the async `openRFCOMMChannelAsync` API with a real delegate
+        // — the modern replacement for the broken sync variant.
+        if let managedPath = Self.findPortPath(forDeviceName: device.name ?? "",
+                                               addressString: addressString) {
+            trace("pre-existing cu.* file found: \(managedPath)")
+            trace("skipping RFCOMM dance — trusting macOS-managed link")
+            self.currentDevice = device
+            // No RFCOMM channel reference to hold — macOS is managing
+            // the link on our behalf. tearDownLink() is still valid
+            // because it's a no-op when rfcommChannel is nil.
+            return managedPath
+        }
+
+        trace("no pre-existing cu.* file — falling back to explicit RFCOMM open")
+
         // Step 2: figure out which RFCOMM channel(s) to try and open one.
         //
         // The TH-D75 historically uses channel 2 for its data path (this
