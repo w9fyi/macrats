@@ -23,6 +23,8 @@ MacRats is **not** a fork of D-Rats. It is a clean-room implementation of the DD
 - ✅ Sign-on / sign-off automatic broadcasts on connect/disconnect (500 ms post-signoff delay on serial for TX tail-out)
 - ✅ Station status broadcasts (online / unattended / offline + free-form message)
 - ✅ Fixed-position GPS beacon — D-Rats APRS `$$CRC` format, byte-for-byte compatible with upstream's `GPSPosition.to_aprs()` + `gpsa_checksum()`. Send-on-demand button in the GPS preferences tab; received beacons update the heard-station list with latitude/longitude/comment and appear as green entries in the chat log
+- ✅ **Stateful reliability layer** (`StatefulSession`) ported from upstream `d_rats/sessions/stateful.py` — sliding window, T_DAT / T_ACK / T_REQACK protocol, in-order delivery with out-of-order buffering and duplicate suppression, 8-bit sequence numbers for interop with older D-Rats clients, 10-retry REQACK cap with progressive backoff, graceful and force-close modes. End-to-end verified over TCP loopback including a 20-block-through-4-block-window retransmit torture test.
+- ✅ **File transfer** (`FileTransferSession`) on top of StatefulSession — full D-Rats file wire protocol (4-byte little-endian size + UTF-8 filename offer block, `OK` / `RESUME:` negotiation, zlib-compressed payload stream). Send File… (⇧⌘S) and Prepare to Receive File… (⇧⌘R) menu commands with native NSOpenPanel + NSAlert dialogs. Progress reported as system-event lines in the chat log at 10% increments. Byte-for-byte verified roundtrip through the DDT2 + stateful + TCP loopback stack.
 - ✅ Chat log persistence to disk (NDJSON, rotating)
 - ✅ SwiftUI app shell: `NavigationSplitView` with stations sidebar + chat view
 - ✅ First-run setup wizard (callsign → connection → device → finish)
@@ -36,8 +38,8 @@ MacRats is **not** a fork of D-Rats. It is a clean-room implementation of the DD
 
 ### Planned
 
-- ⬜ Phase 3 — receive-side test against a second D-Rats-compatible station (needs a peer). Applies to both USB RX and Bluetooth RX verification, plus inbound GPS beacon decoding.
-- ⬜ File transfer sessions (`StatefulSession` reliability layer + `FileTransferSession` on top + drag-and-drop UI — v1.1)
+- ⬜ Phase 3 — receive-side test against a second D-Rats-compatible station (needs a peer). Applies to both USB RX and Bluetooth RX verification, inbound GPS beacon decoding, and file transfer reception.
+- ⬜ File transfer: drag-and-drop UI (polish over the current menu commands), resume support for interrupted transfers (v1.1)
 - ⬜ Events tab + sound alerts (v1.1)
 - ⬜ Map view with MapKit + offline tiles (v1.2)
 - ⬜ Structured form messages (ICS-213, etc.), Winlink email gateway (v1.2+ — see `memory/macrats_feature_parity.md` for the full matrix)
@@ -45,8 +47,10 @@ MacRats is **not** a fork of D-Rats. It is a clean-room implementation of the DD
 ## Test status
 
 ```text
-236 tests, 21 suites, all passing in ~3 seconds.
+249 tests, 23 suites, all passing in ~16 seconds.
 ```
+
+(Most of the extra ~13 seconds is the new `StatefulSessionTests` suite — the reliability-protocol integration tests deliberately push data through several REQACK/ACK roundtrips over TCP loopback, which takes wall-clock time even on a loopback with no network latency.)
 
 - Every golden vector from upstream Python D-Rats is reproduced byte-for-byte
 - Two `MacRatsAppModel` instances exchange chat, ping, and status over TCP loopback in integration tests
@@ -56,6 +60,8 @@ MacRats is **not** a fork of D-Rats. It is a clean-room implementation of the DD
 - `RatflectorHandshakeTests` (13 tests) cover every branch of the text-based auth flow (code 100, 101→200, 101→102→200, 101→500, timeout→old-school, EOF→old-school, unknown code, missing callsign, missing password, rejected password, etc.)
 - `RatflectorDirectoryTests` (17 tests) including the real captured `ratflectors.yml` fixture
 - `GPSBeaconTests` (22 tests) covering the APRS checksum, `deg2nmea` / `nmea2deg`, encode of three golden vectors (Austin, Chicago, Southern hemisphere), comment clipping, station-name space-to-dash conversion, and the full encode→decode roundtrip
+- `StatefulSessionTests` (8 tests) covering single-block, multi-block, bidirectional, and out-of-window (20 blocks through a 4-block window) reliable delivery scenarios over TCP loopback
+- `FileTransferSessionTests` (5 tests) covering zlib roundtrip, zlib header byte signature, full end-to-end file transfer through the DDT2 + stateful layers, and error handling for wrong role and missing files
 - **Live USB over-the-air test passed** against a real Kenwood TH-D75 on 446.100 MHz simplex D-STAR (2026-04-07)
 - **Live Bluetooth over-the-air TX test passed** against the same TH-D75 (2026-04-08) — chat frames transmitted over Bluetooth SPP, confirmed with a second receiver. RX verification pending a second station.
 - **Live Internet test passed** against `sewx.ratflector.com:9000` — handshake, broadcast send, clean disconnect (2026-04-07)
