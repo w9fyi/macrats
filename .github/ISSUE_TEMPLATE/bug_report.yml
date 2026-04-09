@@ -1,0 +1,100 @@
+name: Bug report
+description: Report a problem with MacRats
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem! Fill in what you can — leave blank what you don't know.
+
+  - type: dropdown
+    id: severity
+    attributes:
+      label: How bad is this problem?
+      options:
+        - "Critical — App won't launch, crashes, or lost messages"
+        - "Severe — Can't send or receive messages at all"
+        - "High — Feature broken but I have a workaround"
+        - "Medium — Annoying but usable"
+        - "Low — Cosmetic / suggestion"
+    validations:
+      required: true
+
+  - type: textarea
+    id: what_happened
+    attributes:
+      label: What happened?
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: false
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: false
+
+  - type: input
+    id: app_version
+    attributes:
+      label: MacRats version
+      description: "MacRats menu → About MacRats"
+    validations:
+      required: false
+
+  - type: input
+    id: macos_version
+    attributes:
+      label: macOS version
+      placeholder: "macOS 26.1"
+    validations:
+      required: false
+
+  - type: dropdown
+    id: transport
+    attributes:
+      label: How are you connecting?
+      options:
+        - "TH-D75 via USB cable"
+        - "TH-D75 via Bluetooth"
+        - "Ratflector (internet)"
+        - "Other radio"
+        - "Not connected yet"
+    validations:
+      required: true
+
+  - type: input
+    id: radio_firmware
+    attributes:
+      label: Radio firmware version (if applicable)
+    validations:
+      required: false
+
+  - type: dropdown
+    id: voiceover
+    attributes:
+      label: Were you using VoiceOver?
+      options:
+        - "No"
+        - "Yes"
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Any error messages you saw
+      value: |
+        ```
+        paste here
+        ```
+    validations:
+      required: false
